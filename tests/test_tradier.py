@@ -105,6 +105,7 @@ class AcquisitionTests(OfflineCase):
                 tradier.fetch_history(TOKEN, **KW)
             self.assertNotIn(TOKEN, str(caught.exception))
             self.assertTrue(caught.exception.__suppress_context__)
+            self.assertTrue(caught.exception.stop_batch)
 
     def test_both_rate_limit_status_conventions(self):
         for status, body in ((429, TOKEN), (400, "Quota Violation: Expires 123 " + TOKEN)):
@@ -146,15 +147,13 @@ class AcquisitionTests(OfflineCase):
 
 
 class NormalizationTests(OfflineCase):
-    def test_sorting_is_explicit_and_does_not_mutate_response(self):
+    def test_out_of_order_is_rejected_without_mutating_response(self):
         payload = fixture()
         payload["history"]["day"].reverse()
         first = payload["history"]["day"][0]["date"]
-        history = self.normalize(payload)
-        self.assertTrue(history.reordered)
-        self.assertEqual(history.bars[0].session, START)
+        with self.assertRaisesRegex(tradier.TradierError, "strictly increasing"):
+            self.normalize(payload)
         self.assertEqual(payload["history"]["day"][0]["date"], first)
-        self.assertEqual(history.volumes, (1000,) * 24)
 
     def test_singleton_object(self):
         payload = fixture([50])
@@ -188,7 +187,7 @@ class NormalizationTests(OfflineCase):
                 payload["history"]["day"][0][field] = value
                 with self.subTest(field=field, kind=type(value).__name__), self.assertRaises(tradier.TradierError):
                     self.normalize(payload)
-        for change in (dict(close=111), dict(open=9), dict(high=5), dict(low=120)):
+        for change in (dict(close=-1), dict(open=0), dict(high=5), dict(low=120)):
             payload = fixture()
             payload["history"]["day"][0].update(change)
             with self.assertRaises(tradier.TradierError):
@@ -288,7 +287,7 @@ class ReportTests(OfflineCase):
         self.keychain.assert_not_called()
         self.build.assert_not_called()
 
-    def test_cli_runs_only_three_symbols(self):
+    def test_cli_runs_only_fixed_nineteen_symbols(self):
         payload = fixture()
         payload["history"]["day"][-1]["date"] = str(END)
         history = self.normalize(payload)
@@ -297,17 +296,19 @@ class ReportTests(OfflineCase):
                    side_effect=lambda token, **kwargs: tradier.normalize_history(payload, **kwargs)) as fetch:
             code, out, _ = self.cli(self.args() + ["--fetch"])
         self.assertEqual(code, 0)
-        self.assertEqual([call.kwargs["symbol"] for call in fetch.call_args_list], ["CLX", "CVX", "MCD"])
-        self.assertIn("not a trading recommendation", json.loads(out)["label"])
-        self.assertEqual([result["symbol"] for result in json.loads(out)["results"]], ["CLX", "CVX", "MCD"])
+        self.assertEqual([call.kwargs["symbol"] for call in fetch.call_args_list], list(tradier_report.SYMBOLS))
+        self.assertEqual(json.loads(out)["label"], "Market Sentinel — Informational Screening Results")
+        self.assertIn("not a trading recommendation", json.loads(out)["notice"])
+        self.assertEqual(json.loads(out)["summary"]["evaluated_symbols"], 19)
+        self.assertEqual([result["symbol"] for result in json.loads(out)["results"]], list(tradier_report.SYMBOLS))
 
     def test_partial_failure_stops_and_marks_unattempted(self):
         with patch("market_sentinel.tradier_report.load_token", return_value=TOKEN), \
-             patch("market_sentinel.tradier_report.fetch_history", side_effect=tradier.TradierError("Safe failure")) as fetch:
+             patch("market_sentinel.tradier_report.fetch_history", side_effect=tradier.TradierError("Safe failure", stop_batch=True)) as fetch:
             code, out, _ = self.cli(self.args() + ["--fetch"])
         self.assertEqual(code, 1)
         self.assertEqual(fetch.call_count, 1)
-        self.assertEqual(len(json.loads(out)["results"]), 3)
+        self.assertEqual(len(json.loads(out)["results"]), 19)
         self.assertIn("not attempted", out)
 
     def test_unexpected_reporting_error_does_not_echo_credentials(self):

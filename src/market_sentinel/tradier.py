@@ -13,7 +13,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 
-from market_sentinel.stochastic import DailyOHLC, _validated
+from market_sentinel.stochastic import DailyOHLC, RangeWarning, _range_warnings, _validated
 
 BASES = {"production": "https://api.tradier.com/v1/markets/history",
          "sandbox": "https://sandbox.tradier.com/v1/markets/history"}
@@ -23,6 +23,10 @@ KEYCHAIN_SERVICE = "market-sentinel.tradier"
 
 class TradierError(Exception):
     """Sanitized acquisition/setup failure, with no provider body or credential."""
+
+    def __init__(self, message, *, stop_batch=False):
+        super().__init__(message)
+        self.stop_batch = stop_batch
 
 
 @dataclass(frozen=True)
@@ -36,6 +40,7 @@ class History:
     volumes: tuple[int | float | None, ...]
     excluded_sessions: tuple[date, ...]
     reordered: bool
+    warnings: tuple[RangeWarning, ...] = ()
 
 
 def _environment(environment):
@@ -88,7 +93,7 @@ def _session(value):
 
 
 def normalize_history(payload, *, symbol, environment, start, end, completed_through) -> History:
-    """Validate all rows, sort oldest first, exclude dates after caller-certified cutoff.
+    """Validate all rows oldest first, exclude dates after caller-certified cutoff.
 
     No exchange calendar is inferred: weekday holidays and missing sessions remain
     unverified. Reject the entire response on invalid rows, including excluded rows.
@@ -105,6 +110,7 @@ def normalize_history(payload, *, symbol, environment, start, end, completed_thr
     if not isinstance(rows, list) or not rows or len(rows) > 367:
         raise TradierError("No usable daily history returned or response exceeds range bound.")
     parsed = []
+    warnings = []
     seen = set()
     for row in rows:
         if not isinstance(row, dict):
@@ -112,6 +118,8 @@ def normalize_history(payload, *, symbol, environment, start, end, completed_thr
         session = _session(row.get("date"))
         if session in seen:
             raise TradierError("Duplicate historical session; no indicator calculated.")
+        if parsed and session <= parsed[-1][0].session:
+            raise TradierError("Historical sessions must be strictly increasing; no sorting performed.")
         seen.add(session)
         if not start <= session <= end:
             raise TradierError("Historical session outside requested range.")
@@ -119,7 +127,8 @@ def normalize_history(payload, *, symbol, environment, start, end, completed_thr
             bar = _validated([DailyOHLC(session, *(row[key] for key in
                                 ("open", "high", "low", "close")))])[0]
         except (KeyError, ValueError, TypeError, OverflowError):
-            raise TradierError("Missing or invalid historical OHLC fields.") from None
+            raise TradierError("Structurally invalid OHLC: missing, malformed, nonfinite, nonpositive, inverted range or unsafe magnitude.") from None
+        warnings.extend(_range_warnings(bar))
         volume = row.get("volume")
         if volume is not None:
             try:
@@ -129,14 +138,13 @@ def normalize_history(payload, *, symbol, environment, start, end, completed_thr
             if not valid:
                 raise TradierError("Invalid historical volume.")
         parsed.append((bar, volume))
-    ordered = sorted(parsed, key=lambda pair: pair[0].session)
-    completed = [(bar, volume) for bar, volume in ordered if bar.session <= completed_through]
+    completed = [(bar, volume) for bar, volume in parsed if bar.session <= completed_through]
     if not completed:
         raise TradierError("No observations at or before the completed-session cutoff.")
     return History(symbol, environment, start, end, completed_through,
                    tuple(bar for bar, _ in completed), tuple(volume for _, volume in completed),
-                   tuple(bar.session for bar, _ in ordered if bar.session > completed_through),
-                   parsed != ordered)
+                   tuple(bar.session for bar, _ in parsed if bar.session > completed_through),
+                   False, tuple(warnings))
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -173,9 +181,9 @@ def fetch_history(token: str, *, symbol: str, environment: str,
         finally:
             error.close()
         if status in (401, 403):
-            raise TradierError("Tradier authentication/entitlement rejected; check environment and token.") from None
+            raise TradierError("Tradier authentication/entitlement rejected; check environment and token.", stop_batch=True) from None
         if status == 429 or (status == 400 and b"Quota Violation" in raw):
-            raise TradierError("Tradier rate limit reached; no automatic retry.") from None
+            raise TradierError("Tradier rate limit reached; no automatic retry.", stop_batch=True) from None
         raise TradierError("Tradier HTTP failure; history not verified.") from None
     except (OSError, URLError, HTTPException):
         raise TradierError("Tradier network/TLS failure or timeout; history not verified.") from None

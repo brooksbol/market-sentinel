@@ -196,7 +196,7 @@ class ValidationTests(unittest.TestCase):
     def test_invalid_ohlc_structure(self):
         bar = fixed_range([50])[0]
         for changes in ({"low": 0}, {"low": -1}, {"high": -1}, {"high": 5},
-                        {"open": 111}, {"open": 9}, {"close": 111}, {"close": 9}):
+                        {"open": 0}, {"close": -1}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 stochastic_14_3_3([replace(bar, **changes)])
 
@@ -279,12 +279,11 @@ class CrossingTests(unittest.TestCase):
         self.assertTrue(crossed_below_20(20, -2e-14))
         self.assertTrue(crossed_below_20(100 + 2e-14, 19))
         self.assertFalse(crossed_below_20(20 - 1e-12, 19))
-        with self.assertRaises(ValueError):
-            crossed_below_20(20, -1e-8)
+        self.assertTrue(crossed_below_20(20, -1e-8))  # Warned prices may yield negative K.
 
 
     def test_invalid_values_are_errors_even_with_an_unavailable_neighbor(self):
-        for invalid in (float("nan"), float("inf"), -1, 101, True, "20"):
+        for invalid in (float("nan"), float("inf"), True, "20"):
             for values in ((invalid, 19), (21, invalid), (None, invalid)):
                 with self.subTest(kind=type(invalid).__name__), self.assertRaises(ValueError):
                     crossed_below_20(*values)
