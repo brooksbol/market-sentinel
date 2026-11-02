@@ -14,8 +14,9 @@ or missed screening signals from imperfect historical prices.
 Implemented: standalone Pushover test transport, TA-Lib Stochastic(14,3,3), pure
 crossing detection, and an explicitly invoked Tradier report for all 19 configured
 symbols. Range inconsistencies produce structured warnings without price repair.
-RSI, persistence, durable deduplication, daily notification receipts and scheduling
-remain unimplemented. Indicator results are not connected to Pushover. This is
+A pure full-universe formatter and explicitly authorized one-message Pushover
+report are also implemented. RSI, persistence, durable deduplication, automatic
+actionable alerts and scheduled daily delivery remain unimplemented. This is
 independent of Wheelwright's runtime, credentials and Product boundaries.
 
 ## Environment and development
@@ -166,6 +167,89 @@ safe diagnostics, explicit send intent and CLI exit status. No live push is need
 for code-level completion. Stochastic fixtures and pure crossings are implemented
 below. Future acceptance includes independent real-data validation, RSI, durable identities,
 deduplication, missed-session recovery, all-symbol data validation, then scheduling.
+
+## Full daily universe report — explicit one-message delivery
+
+There are two separate notification products:
+
+- **Actionable attention alerts:** future event-driven notifications for new
+  downward crossings; automatic delivery and durable event identity remain planned.
+- **Daily universe report:** replaces the proposed generic keep-alive. Always
+  includes all 19 fixed symbols, sorted by unrounded smoothed K ascending, with
+  symbol as tie-breaker. Columns show close (two decimals), K and D (one decimal).
+  Crossings and currently-below-20 counts are distinct and use unrounded results.
+
+`market_sentinel.daily_report.format_daily_report(screening, demonstration=False)`
+is pure: it accepts the evaluated dictionary produced by `tradier_report`, validates
+its summary and per-symbol results, and returns one complete body. It performs no
+price acquisition, indicator calculation, credential access, I/O or mutation.
+`send_daily_report(token, user_key, screening, demonstration=False)` preflights
+that body and calls Pushover exactly once with `monospace=1`; it never retries,
+truncates, splits, sends attachments or substitutes a partial report.
+
+All 19 symbols must appear exactly once with usable same-session close/K/D and an
+available adjacent-K crossing evaluation. Failed, missing, stale, undefined or
+mixed-session results and inconsistent counts raise `ReportError` before HTTP.
+Accepted range warnings remain visible as `Warnings: N sample; M on session`,
+separating historical-sample occurrences from those dated to the report session.
+A complete report describes supplied screening results; it does not certify
+independent exchange-calendar continuity or market-price truth.
+
+The title is **Market Sentinel — Daily Report**, with **TEST** appended for a
+demonstration. Demo bodies explicitly identify previously verified data and say
+that they are not a live scheduled result. The October 30, 2026 retained dataset
+formats to **619 characters / 619 UTF-8 bytes**, including all 19 rows, two current
+oversold observations, zero new crossings and 13 sample warnings (zero on session).
+There is room to add an RSI column in a separately authorized slice; no RSI values
+or placeholder calculations are implemented now.
+
+Pushover permits **1,024 UTF-8 characters**, not 1,024 bytes or percent-encoded
+HTTP bytes. The shared transport validates UTF-8 encodability, body code-point
+count and the separate 250-character title limit before HTTP. Combining marks
+count individually; malformed surrogate text is rejected. It never rounds or
+truncates to satisfy limits. Monospace applies inside supported Pushover clients;
+mobile notification banners display plain text. HTML is not enabled. Priority,
+sound and other delivery settings remain unchanged. [Official API requirements](https://pushover.net/api)
+checked November 2, 2026.
+
+Preview existing evaluated results without reading credentials or sending:
+
+```python
+import json
+from pathlib import Path
+from market_sentinel.daily_report import format_daily_report
+
+# Existing screening JSON kept outside the public checkout.
+screening = json.loads(Path("/absolute/path/outside/checkout/report.json").read_text())
+body = format_daily_report(screening, demonstration=True)
+print(body)
+print(len(body), len(body.encode("utf-8")))
+```
+
+Only with explicit operator authorization for one real notification:
+
+```python
+from market_sentinel.pushover import load_credentials
+from market_sentinel.daily_report import send_daily_report
+
+token, user_key = load_credentials()
+send_daily_report(token, user_key, screening, demonstration=True)
+```
+
+API acceptance does not confirm phone receipt. A timeout can follow acceptance;
+check the phone before authorizing another attempt. There is no automatic retry,
+deduplication or delivery schedule. The older fixed `push-test` and three-message
+historical `demo_push` remain separate, tested commands; the latter is preserved
+as a demonstration fixture, not the daily report product. Earlier RETEST receipt,
+locked-screen display and audible delivery were independently operator-confirmed.
+Each new live demonstration requires its own authorization and receipt confirmation.
+
+On November 2, 2026, the consolidated October 30 daily-report demonstration was
+accepted by Pushover (HTTP 200 / status 1) in **one request**, with `monospace=1`,
+no retries and no priority/sound overrides. Its complete body was 619 characters
+and 619 UTF-8 bytes. Receipt of this particular report remains pending operator
+confirmation. **150 offline tests passed**; previous demonstration files were
+preserved in a separate commit before the formatter work.
 
 ## Stochastic(14,3,3) — TA-Lib migration complete
 
@@ -479,15 +563,14 @@ threshold/direction and completed session date. Recover unprocessed sessions
 chronologically; prevent ordinary duplicate alerts. Exactly-once event recording
 does not imply exactly-once notification delivery.
 
-**Daily receipt: “Nothing is something.”** Every completed trading session must
-eventually have one accountable logical monitoring receipt, preferably sent as one
-consolidated notification. A quiet success reports 19/19 evaluated, both crossing
-counts, current data and no acquisition signals. A signal receipt lists new
-crossings with symbol, indicator, prior/current values, close and original session
-date, marked informational/manual review required. Failure reports incomplete or
-stale evaluations and never claims successful zero signals. Retries/revisions
-update the logical receipt while preserving history; exact-once push delivery is
-not promised.
+**Daily universe report: “Nothing is something.”** Every completed session should
+eventually have one accountable report containing all 19 symbols, ordered by
+ascending unrounded Stochastic K, regardless of crossing activity. This replaces
+the generic keep-alive. Explicit single-message formatting/delivery is implemented
+above; durable per-session progress and automatic delivery are not. Actionable new
+crossing alerts remain a separate product. Incomplete evaluation must not be
+presented as successful zero signals. Future state must retain failures, retries
+and revisions; exactly-once phone delivery is not promised.
 
 **Scheduling:** eventual macOS launchd invocation around 18:37 America/New_York,
 with wake/startup catch-up. The monitor, not the scheduler, owns session selection,

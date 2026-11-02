@@ -73,11 +73,32 @@ def send_test_push(token: str, user_key: str) -> None:
     _send_message(token, user_key, TITLE, MESSAGE)
 
 
-def _send_message(token: str, user_key: str, title: str, message: str) -> None:
+def validate_message(title: str, message: str) -> None:
+    """Check decoded UTF-8 character limits, not percent-encoded POST size.
+
+    Pushover permits 1024 Unicode characters (up to four UTF-8 bytes each).
+    Python len counts code points, including combining marks separately. Reject
+    invalid UTF-8/surrogates rather than replacing or truncating content.
+    """
+    if not isinstance(title, str) or not isinstance(message, str) or not message:
+        raise PushError("A text title and nonempty message are required.")
+    try:
+        title.encode("utf-8")
+        message.encode("utf-8")
+    except UnicodeError:
+        raise PushError("Notification contains invalid UTF-8 text.") from None
+    if len(title) > 250 or len(message) > 1024:
+        raise PushError("Pushover limit exceeded: title 250 characters, body 1024. Nothing sent.")
+
+
+def _send_message(token: str, user_key: str, title: str, message: str, *, monospace: bool = False) -> None:
     """Shared private transport; callers own explicit authorization and payloads."""
     _validate_credentials(token, user_key)
-    body = urlencode({"token": token, "user": user_key, "title": title,
-                      "message": message}).encode("ascii")
+    validate_message(title, message)
+    fields = {"token": token, "user": user_key, "title": title, "message": message}
+    if monospace:
+        fields["monospace"] = "1"
+    body = urlencode(fields, encoding="utf-8", errors="strict").encode("ascii")
     request = Request(ENDPOINT, data=body, method="POST", headers={
         "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
         "User-Agent": "Market-Sentinel-Transport-Test/0.1",

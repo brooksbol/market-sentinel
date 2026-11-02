@@ -10,8 +10,7 @@ from market_sentinel.__main__ import _SafeParser
 from market_sentinel.stochastic import stochastic_14_3_3
 from market_sentinel.tradier import TradierError, fetch_history, load_token
 
-SYMBOLS = ("CLX", "O", "CVX", "NUE", "ADM", "MCD", "IBM", "XOM", "CAT", "TGT",
-           "SWK", "SHW", "WMT", "PG", "ABBV", "APD", "TROW", "KO", "PEP")
+from market_sentinel.universe import SYMBOLS
 LABEL = "Market Sentinel — Informational Screening Results"
 NOTICE = "Attention signals for independent manual review; not a trading recommendation. Prices are not corrected or independently verified."
 
