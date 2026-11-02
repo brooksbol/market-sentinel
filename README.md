@@ -26,9 +26,28 @@ python3.14 -m venv .venv
 .venv/bin/python -m pip install -e .
 ```
 
-There are no third-party runtime or test dependencies. Packaging uses setuptools;
-tests use Python's standard-library `unittest`. Routine verification must never
-contact Pushover or the operator's Keychain.
+Production indicator mathematics use **TA-Lib==0.8.3**, the maintained Python
+binding to the open-source C library. This current release is pinned for deliberate,
+tested upgrades. NumPy is installed through TA-Lib's own dependency metadata;
+there is no duplicate direct NumPy requirement. Tests use standard-library
+`unittest` plus the installed numerical dependency. Packaging uses setuptools.
+Routine verification must never contact Pushover or the operator's Keychain.
+
+Binary wheels bundle the C library. Verified here: Python **3.14.10**, macOS arm64,
+TA-Lib Python/C **0.8.3**, NumPy **2.5.4**, installed without a compiler, Homebrew
+TA-Lib or a separate native-library installation. PyPI also publishes Python 3.12
+macOS and Linux wheels; those platforms were not executed here. To require wheels:
+
+```sh
+.venv/bin/python -m pip install --only-binary=TA-Lib,numpy -e .
+```
+
+The chosen Python/OS/architecture must have matching wheels. Otherwise an explicit
+source build needs a compiler and CMake; upstream 0.8.3 downloads and verifies its
+pinned C source during that build unless configured to use an existing C library.
+For future cloud packaging, prefer matching Linux wheels and rerun fixtures on
+that runtime. No cloud runtime or Wheelwright environment is changed here. NumPy's
+resolved version is recorded above, not separately pinned by this project.
 
 ```sh
 .venv/bin/python -m unittest discover -s tests -v
@@ -140,126 +159,131 @@ Tests mock HTTP and Keychain using synthetic credentials, including successful
 request construction, rejected credentials, malformed/provider errors, timeout,
 safe diagnostics, explicit send intent and CLI exit status. No live push is needed
 for code-level completion. Stochastic fixtures and pure crossings are implemented
-below. Future acceptance includes TradingView comparison, RSI, durable identities,
+below. Future acceptance includes independent real-data validation, RSI, durable identities,
 deduplication, missed-session recovery, all-symbol data validation, then scheduling.
 
-## Stochastic(14,3,3) — implemented, offline-tested
+## Stochastic(14,3,3) — TA-Lib migration complete
 
-Public API in `market_sentinel.stochastic`:
+The Principal selected TA-Lib for production Stochastic and future RSI mathematics.
+Market Sentinel owns input/session validation, crossing semantics and availability;
+there is no indicator registry or parallel custom smoothing implementation.
+
+Public API in `market_sentinel.stochastic` is retained:
 
 ```python
 from datetime import date, timedelta
 from market_sentinel.stochastic import DailyOHLC, crossed_below_20, stochastic_14_3_3
 
-# Illustrative caller-supplied sessions, not real market observations/calendar.
-bars = [
-    DailyOHLC(date(2026, 1, 1) + timedelta(days=i), open=60, high=110, low=10, close=60)
-    for i in range(18)
-]
+# Synthetic caller-supplied dates, not actual exchange-calendar observations.
+bars = [DailyOHLC(date(2026, 1, 1) + timedelta(days=i), 60, 110, 10, 60) for i in range(18)]
 points = stochastic_14_3_3(bars)
 assert (points[-1].raw_k, points[-1].k, points[-1].d) == (50, 50, 50)
 assert crossed_below_20(20, 19.999999999) is True
 ```
 
-`DailyOHLC(session, open, high, low, close)` and returned `StochasticPoint` are
-immutable dataclasses. The calculation accepts an iterable and returns a tuple
-with one point for every input session, including warm-up. Each point contains
-`session`, `raw_k`, smoothed `k`, `d`, `crossed_below_20` and `zero_range`.
-Empty input returns `()`.
+Immutable `DailyOHLC(session, open, high, low, close)` inputs produce an immutable
+point per supplied session: `session`, `raw_k`, `k`, `d`, `crossed_below_20`,
+`zero_range`. Empty input returns `()`. Inputs are float64 arrays for this exact call:
 
-For each session, raw K is `100 * (close - lowest_low) / (highest_high - lowest_low)`
-over that session and the preceding 13 supplied sessions. K is the three-value
-simple mean of raw K; D is the three-value simple mean of K. Implementation divides
-the price difference before multiplying by 100 to avoid unnecessary overflow, and
-uses `math.fsum` for the small SMA sums. There is no explicit rounding, EMA,
-Wilder smoothing or Stochastic RSI calculation.
+```python
+slow_k, slow_d = talib.STOCH(
+    high, low, close,
+    fastk_period=14, slowk_period=3, slowk_matype=0,
+    slowd_period=3, slowd_matype=0,
+)
+```
 
-| Value | First available observation (one-based) |
-|---|---|
-| Raw K | 14 |
-| Smoothed K | 16 |
-| D | 18 |
-| Possible K crossing | 17; D is not required |
+Both moving averages are simple (type 0). **K/D come from TA-Lib.** `raw_k` is a
+small, separately calculated **informational** value using the original 14-session
+high/low formula, not a TA-Lib output and never a trigger. No custom K/D smoothing
+remains. No prices, intermediate results or outputs are deliberately rounded.
 
-**Unavailable and zero-range policy:** insufficient warm-up is `None`, never zero.
-If the 14-session high equals its low, raw K is also `None`, with `zero_range=True`
-on that point. Warm-up points have `zero_range=False`. Smoothing requires three
-consecutive available inputs: an undefined raw value invalidates affected K and D
-windows until new valid windows exist. The detector never bridges unavailable K.
-Constant OHLC therefore stays unavailable; constant closes within a nonzero OHLC
-range can produce a valid number. This explicit flat-window policy is not yet
-verified against TradingView's handling of undefined values.
+### Verified numerical conventions and migration differences
 
-**Input contract:** all observations describe one security, already completed and
-on one consistent adjustment basis. Session identity must be `datetime.date`, not
-a string or `datetime.datetime`, and must strictly increase without duplicates.
-OHLC fields must be finite Python `int` or `float` values (booleans and numeric
-strings are rejected), representable as finite floats, with
-`0 < low <= open/close <= high`. Calculations use binary floating-point values;
-no corporate-action adjustment or display rounding is applied. Invalid supplied
-records/values/order raise `ValueError`; omitting a required dataclass constructor
-argument raises `TypeError`. No partially calculated result is returned.
+The pre-migration implementation and fixtures are preserved in commit
+`d086ff27863a78d90d59509a49fa187737c6f902`. Differences below are deliberate and
+independently tested, not silently rewritten reference values.
 
-**Coverage belongs to the caller:** this module does not infer session completion,
-market holidays or whether a date gap is an omitted trading session. The caller
-must supply contiguous completed trading sessions or reject incomplete coverage
-before calling. A supplied missing record/field value is rejected; nothing is
-sorted, filled, skipped or interpolated. Revisions require explicitly supplying
-the corrected observations and recomputing; prior results are not mutated.
+| Concern | Prior custom implementation | TA-Lib migration |
+|---|---|---|
+| Raw K | First at observation 14 | Retained as informational at 14 |
+| K/D warm-up | K at 16; D at 18 | STOCH exposes **both at 18** (lookback 17) |
+| Earliest crossing | Observation 17 | **Observation 19**: first available K has no previous available K |
+| Exact flat range | Raw/K/D unavailable in affected windows | Library returns numeric zero; Market Sentinel masks affected outputs as unavailable |
+| SMA precision | `math.fsum` on each window | TA-Lib's rolling floating-point sums; tiny residuals possible |
+| Machine-near-flat range | Exact-formula raw K | TA-Lib's relative zero tolerance may produce K/D=0 even for a nonzero range |
+| Extreme finite magnitude | Safe custom formula could handle it | Reject OHLC when `high + low` is nonfinite; TA-Lib's magnitude guard would otherwise misleadingly return zero |
 
-**Crossings:** `crossed_below_20(previous, current)` returns true only for unrounded
-`previous >= 20 and current < 20`. Missing values return false; supplied nonfinite
-or out-of-range oscillator values raise `ValueError`. Each output's flag compares
-only the immediately preceding point's K with current K. Raw K and D never trigger
-it. Consecutive below-20 values do not repeat; recovery to exactly 20 or above
-allows a later crossing. This is a pure adjacent-value result, not a durable event,
-notification, re-arming store or deduplication mechanism.
+**Exact zero-range availability:** raw K is `None` with `zero_range=True` when the
+14-session highest high equals the lowest low. K is masked if any of its three
+raw inputs are unavailable; D is masked if any of its five contributing raw inputs
+are unavailable. This small validity mask retains the existing no-undefined-signal
+policy. It performs no substitute indicator calculation and never skips a gap.
+TA-Lib still computes K/D; after those affected windows pass, its outputs resume.
 
-### Numerical evidence
+**Near-flat convention:** TA-Lib C 0.8.3 uses a scale-aware zero test against
+`abs(highest) + abs(lowest)`. For low=100 and high=close=100+1e-12, informational
+raw K is 100, but library K/D are 0. `zero_range` means **exact** zero range, so is
+false in that fixture. This library numerical convention is adopted under the
+TA-Lib selection; near-flat transitions can consequently differ from the prior
+custom calculation. It is distinct from missing data and from the exact-flat mask.
 
-The complete offline suite includes 30 Stochastic/crossing tests and 20 existing
-Pushover tests. Expected values come from hand-derived fixtures, not a second
-indicator implementation. With every bar's range [10,110], closes `10+x` give
-raw K exactly `x` mathematically. The test reference raw sequence
-`30,60,90,30,0,0,0,60,0,0,0` gives K
-`None,None,60,60,40,10,0,20,20,20,0`; D first becomes `160/3`, then `110/3`.
-Separate fixtures force independent rolling-high/low eviction and verify rising,
-falling, oscillating, zero-range, recovery and near-20 behavior. Prefix comparisons
-check that later observations cannot change earlier results.
+**NaN/invalid data:** missing/nonfinite inputs fail before TA-Lib is called. Direct
+library probing shows a NaN close can contaminate the remaining SMA series rather
+than recover after its nominal window; H/L NaNs can contaminate later. Market
+Sentinel never passes these inputs or fills them. Nonfinite library outputs map to
+`None`; adjacent unavailable K values cannot establish a crossing.
 
-### TradingView comparison — pending operator-supplied reference
+**Floating-point boundaries:** a recovery fixture yields D about -1.9e-14 rather
+than mathematical zero. Values are not clamped. The crossing helper permits only
+1e-10 of numerical spill beyond [0,100], while rejecting larger out-of-range
+values. **There is no tolerance at threshold 20:** compare the actual unrounded
+`previous >= 20 and current < 20`. Last-bit differences from custom summation can
+change a classification extremely close to 20; TA-Lib is now calculation authority.
+Raw K and D never independently trigger, and consecutive below-20 values do not
+repeat. Recovery to exactly 20 or above allows a later crossing. No durable event
+identity, re-arming store, notification or deduplication is implemented.
 
-Formula reference: [TradingView's standard Stochastic definition and settings](https://www.tradingview.com/support/solutions/43000502332-stochastic-stoch/).
-Synthetic tests do **not** establish TradingView equivalence. No TradingView data
-was scraped, account created, or live market data acquired for this slice.
+### Input and validation contract
 
-Reproducible manual comparison:
+Supply one security's chronological completed sessions on a consistent OHLC
+adjustment basis. Session identity must be `datetime.date`, not string/datetime;
+dates must strictly increase without duplicates. All OHLC fields must be finite
+Python int/float values (not booleans/strings), with
+`0 < low <= open/close <= high`, and safe magnitude as described above. Invalid
+records/values/order raise `ValueError`; a missing dataclass constructor argument
+raises `TypeError`. The entire input is validated before calculation.
 
-1. Select the exact exchange/listing and ordinary candlestick **1D** chart in
-   TradingView. Add **Stochastic (STOCH)**, not Stochastic RSI. Set K/lookback **14**,
-   Smooth K **3**, D **3**, indicator timeframe **1D/chart**. Reference lines 80/20
-   are display settings; only K crossing below 20 is relevant here.
-2. Fix regular-session and split/dividend-adjustment conventions. Obtain matching
-   H/L/C from the same chart source; never mix adjusted close with raw H/L. Capture
-   O as well for input validation. Use only completed sessions, oldest first.
-3. Manually supply at least **19 consecutive completed bars** and the displayed K/D
-   for the last two sessions (use chart export only if already available to the
-   operator). Record exchange, dates, settings, precision and observation values.
-   No automated TradingView access is needed or commissioned.
-4. Construct `DailyOHLC` values and run `stochastic_14_3_3` offline. Compare the last
-   two K/D values and the exact K crossing. Eighteen valid bars suffice for one
-   fully warmed D; nineteen provide two fully warmed reference points.
-5. With identical full-precision inputs, investigate differences above **1e-8
-   oscillator units**. For rounded chart displays, account for half the last shown
-   decimal unit as display uncertainty. Display agreement near 20 cannot prove a
-   crossing: seek sufficient source precision or leave the classification pending.
-   Never use validation tolerance as a different trading threshold.
+The caller establishes consecutive completed trading-session coverage. This pure
+layer cannot distinguish holidays from omitted sessions or infer market completion.
+It does not sort, interpolate, fill, adjust prices, fetch data or retain state.
+Revised observations must be supplied explicitly for recomputation.
 
-Outstanding compatibility checks: flat-window/undefined-value handling (including
-whether smoothing skips undefined values), initial partial-window behavior,
-floating-point summation differences, chart price precision and corporate-action
-adjustment conventions. Early warm-up is deliberately the strict 14/16/18 contract
-above even if a reference platform displays earlier partial-window values.
+### Verification and remaining evidence
+
+Verification on November 2, 2026: **60 offline tests passed**, including all 20
+unchanged Pushover tests, on Python 3.14.10. Editable and clean non-editable wheel
+installation were exercised; package dependency checks and safe CLI behavior passed.
+
+Hand-derived fixtures remain authoritative checks on standard arithmetic: fixed
+range [10,110] and closes `10+x` give raw K=x. The unchanged reference sequence
+`30,60,90,30,0,0,0,60,0,0,0` has mathematical K
+`None,None,60,60,40,10,0,20,20,20,0` and first D `160/3`, then `110/3`.
+TA-Lib withholds the two early K=60 values to align outputs; the exposed results
+match within 1e-12. Existing flat-window and rolling-extreme fixtures are retained.
+Tests explicitly classify changed availability, library tolerance, NaN propagation,
+parameterization, bounds noise, unsafe magnitudes and full-precision crossings.
+
+**TradingView comparison is no longer a mandatory acceptance gate or dependency.**
+Independent synthetic references plus later, separately authorized real-data
+validation replace it. Real-data coverage, source adjustments and session timing
+remain unverified; no prices or credentials were acquired in this migration.
+
+Upstream sources checked November 2, 2026:
+[Python package metadata/wheels](https://pypi.org/project/TA-Lib/0.8.3/),
+[installation documentation](https://github.com/TA-Lib/ta-lib-python),
+[STOCH C implementation](https://github.com/TA-Lib/ta-lib/blob/v0.8.3/src/ta_func/ta_STOCH.c),
+[scaled-zero guard](https://github.com/TA-Lib/ta-lib/blob/v0.8.3/src/ta_func/ta_utility.h).
 
 ## Intended monitor — requirements, not implemented
 
@@ -283,13 +307,13 @@ Fixed initial universe:
   only. Higher expected event frequency is an operational-testing hypothesis,
   not evidence of better acquisition performance. RSI remains a separate
   acquisition-signal hypothesis. Any historical strategy study is a separate task.
-- Stochastic warm-up, zero-range and supplied-invalid-data policies are implemented
-  above. RSI conventions and calendar coverage validation remain future work.
-  Validate against TradingView's regular 1D indicators with matching observations
-  and adjustment settings before operational acceptance.
+- Stochastic delegates K/D to TA-Lib with the explicit policies above. RSI will
+  also use TA-Lib in a separate slice. Independent numerical fixtures and later
+  real-data/session validation are required; TradingView comparison is optional.
 
-**Data:** Alpaca Basic historical SIP daily OHLC is the candidate, subject to
-authenticated coverage, entitlement, freshness and TradingView validation. Acquire
+**Data:** Tradier is the first candidate for a separately authorized market-data
+feasibility investigation, not a final provider selection or integration. Establish
+historical OHLC availability, entitlement, adjustments, coverage and freshness. Acquire
 once for both indicators. Use only completed US equity sessions; handle holidays,
 early closes, DST, missing/duplicate bars and revised history. Apply consistent
 split adjustments to every OHLC field; choose dividend treatment explicitly.

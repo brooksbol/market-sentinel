@@ -5,12 +5,19 @@ The reference raw sequence 30,60,90,30,0,0,0,60,0,0,0 gives:
 K: -, -, 60,60,40,10,0,20,20,20,0
 D: -, -, -, -, 160/3,110/3,50/3,10,40/3,20,40/3
 Only raw-sequence positions 6 and 11 (one-based) cross below 20.
+Migration: TA-Lib STOCH withholds the first two mathematically available K
+values (60,60) to align K/D at bar 18. Keep the table as independent evidence;
+only availability expectations change. TA-Lib's SMA may differ by a few ULPs.
 """
 
 import unittest
 from dataclasses import FrozenInstanceError, replace
 from datetime import date, datetime, timedelta
 from unittest.mock import patch
+
+import numpy as np
+import talib
+from talib import abstract
 
 from market_sentinel.stochastic import DailyOHLC, crossed_below_20, stochastic_14_3_3
 
@@ -36,7 +43,8 @@ class CalculationTests(unittest.TestCase):
             with self.subTest(count=count):
                 point = stochastic_14_3_3(fixed_range([50] * count))[-1]
                 self.assertEqual(point.raw_k, 50 if count >= 14 else None)
-                self.assertEqual(point.k, 50 if count >= 16 else None)
+                # Prior custom K began at 16; STOCH aligns both outputs at 18.
+                self.assertEqual(point.k, 50 if count >= 18 else None)
                 self.assertEqual(point.d, 50 if count >= 18 else None)
                 self.assertFalse(point.zero_range)
                 self.assertFalse(point.crossed_below_20)
@@ -68,6 +76,11 @@ class CalculationTests(unittest.TestCase):
         for index, point in enumerate(points):
             with self.subTest(raw_position=index + 1):
                 self.assertAlmostEqual(point.raw_k, raw[index], delta=1e-12)
+                if index in (2, 3):
+                    self.assertEqual(k[index], 60)  # Original hand-derived expectation.
+                    self.assertIsNone(point.k)  # TA-Lib withholding, not a changed mean.
+                    self.assertIsNone(point.d)
+                    continue
                 for actual, expected in ((point.k, k[index]), (point.d, d[index])):
                     if expected is None:
                         self.assertIsNone(actual)
@@ -102,7 +115,8 @@ class CalculationTests(unittest.TestCase):
         self.assertEqual(points[34].k, 0)
         self.assertIsNone(points[34].d)
         self.assertIsNone(points[35].d)
-        self.assertEqual(points[36].d, 0)
+        # TA-Lib rolling SMA leaves about -1.9e-14 here, unlike fsum's exact zero.
+        self.assertAlmostEqual(points[36].d, 0, delta=1e-12)
         self.assertFalse(any(point.crossed_below_20 for point in points[31:]))
 
     def test_rising_series_closing_at_high_is_100(self):
@@ -135,15 +149,24 @@ class CalculationTests(unittest.TestCase):
         self.assertGreater(points[-1].d, 20)
         self.assertTrue(points[-1].crossed_below_20)
 
-    def test_k_crossing_can_precede_first_d(self):
+    def test_talib_withholds_early_k_crossing_before_joint_warmup(self):
         points = stochastic_14_3_3(with_raw_sequence([30, 30, 0, 0]))
-        self.assertEqual(points[-2].k, 20)
-        self.assertEqual(points[-1].k, 10)
+        # Previously K=20 -> 10 at bars 16/17. STOCH exposes neither K nor D yet.
+        self.assertEqual((30 + 30 + 0) / 3, 20)
+        self.assertEqual((30 + 0 + 0) / 3, 10)
+        self.assertIsNone(points[-2].k)
+        self.assertIsNone(points[-1].k)
         self.assertIsNone(points[-1].d)
-        self.assertTrue(points[-1].crossed_below_20)
+        self.assertFalse(points[-1].crossed_below_20)
+
+    def test_first_exposed_low_k_cannot_establish_a_crossing(self):
+        points = stochastic_14_3_3(fixed_range([0] * 20))
+        self.assertIsNone(points[16].k)
+        self.assertEqual(points[17].k, 0)
+        self.assertFalse(any(point.crossed_below_20 for point in points))
 
     def test_end_to_end_crossing_does_not_round_to_20(self):
-        points = stochastic_14_3_3(with_raw_sequence([20.00000003] * 3 + [19.99999991]))
+        points = stochastic_14_3_3(with_raw_sequence([20.00000003] * 5 + [19.99999991]))
         previous, current = points[-2:]
         self.assertGreater(previous.k, 20)
         self.assertLess(current.k, 20)
@@ -213,10 +236,17 @@ class ValidationTests(unittest.TestCase):
         self.assertEqual(points[-1].session, bars[-1].session)
         self.assertEqual(points[-1].raw_k, 50)
 
-    def test_large_finite_prices_do_not_overflow_raw_k(self):
+    def test_unsafe_talib_magnitudes_are_explicitly_rejected(self):
         bars = [DailyOHLC(START + timedelta(days=i), 1e308, 1.7e308, 1e307, 1e308)
                 for i in range(18)]
-        # (1e308 - 1e307) / (1.7e308 - 1e307) = 9/16.
+        # Prior custom arithmetic returned 56.25. TA-Lib's |H|+|L| guard
+        # overflows and produces a misleading zero: reject instead of substituting.
+        with self.assertRaisesRegex(ValueError, "safe TA-Lib"):
+            stochastic_14_3_3(bars)
+
+    def test_large_safe_prices_retain_the_fractional_reference(self):
+        bars = [DailyOHLC(START + timedelta(days=i), 1e101, 1.7e101, 1e100, 1e101)
+                for i in range(18)]
         self.assertAlmostEqual(stochastic_14_3_3(bars)[-1].k, 56.25, delta=1e-12)
 
 
@@ -245,11 +275,98 @@ class CrossingTests(unittest.TestCase):
         self.assertTrue(crossed_below_20(20.000000001, 19.999999999))
         self.assertFalse(crossed_below_20(19.999999999, 19))
 
+    def test_tiny_talib_bounds_noise_is_not_clamped_or_a_threshold_epsilon(self):
+        self.assertTrue(crossed_below_20(20, -2e-14))
+        self.assertTrue(crossed_below_20(100 + 2e-14, 19))
+        self.assertFalse(crossed_below_20(20 - 1e-12, 19))
+        with self.assertRaises(ValueError):
+            crossed_below_20(20, -1e-8)
+
+
     def test_invalid_values_are_errors_even_with_an_unavailable_neighbor(self):
         for invalid in (float("nan"), float("inf"), -1, 101, True, "20"):
             for values in ((invalid, 19), (21, invalid), (None, invalid)):
                 with self.subTest(kind=type(invalid).__name__), self.assertRaises(ValueError):
                     crossed_below_20(*values)
+
+
+class TalibConventionTests(unittest.TestCase):
+    def test_explicit_stoch_parameters_and_float64_inputs(self):
+        real_stoch = talib.STOCH
+        with patch("market_sentinel.stochastic.talib.STOCH", wraps=real_stoch) as call:
+            stochastic_14_3_3(fixed_range([50] * 20))
+        self.assertEqual(call.call_args.kwargs, dict(
+            fastk_period=14, slowk_period=3, slowk_matype=0, slowd_period=3, slowd_matype=0))
+        for values, expected in zip(call.call_args.args, (110, 10, 60)):
+            self.assertEqual(values.dtype, np.float64)
+            np.testing.assert_array_equal(values, np.full(20, expected))
+
+    def test_library_lookback_and_initialization_are_joint(self):
+        function = abstract.Function('STOCH')
+        function.set_parameters(dict(fastk_period=14, slowk_period=3, slowk_matype=0,
+                                     slowd_period=3, slowd_matype=0))
+        self.assertEqual(function.lookback, 17)
+        k, d = talib.STOCH(np.full(20, 110.), np.full(20, 10.), np.full(20, 60.), 14, 3, 0, 3, 0)
+        self.assertTrue(np.isnan(k[:17]).all())
+        self.assertTrue(np.isnan(d[:17]).all())
+        np.testing.assert_array_equal(k[17:], [50, 50, 50])
+        np.testing.assert_array_equal(d[17:], [50, 50, 50])
+
+    def test_library_flat_zero_is_masked_as_unavailable_by_monitor(self):
+        values = np.full(20, 100.)
+        k, d = talib.STOCH(values, values, values, 14, 3, 0, 3, 0)
+        np.testing.assert_array_equal(k[17:], [0, 0, 0])
+        np.testing.assert_array_equal(d[17:], [0, 0, 0])
+        bars = [DailyOHLC(START + timedelta(days=i), 100, 100, 100, 100) for i in range(20)]
+        self.assertTrue(all(point.k is None and point.d is None for point in stochastic_14_3_3(bars)))
+
+    def test_library_near_flat_tolerance_is_not_raw_k_arithmetic(self):
+        bars = [DailyOHLC(START + timedelta(days=i), 100, 100 + 1e-12, 100, 100 + 1e-12)
+                for i in range(20)]
+        point = stochastic_14_3_3(bars)[-1]
+        # TA-Lib's scaled-zero tolerance treats this nonzero range as machine-flat.
+        # Informational exact-formula raw K is 100; production K/D follow TA-Lib.
+        self.assertEqual(point.raw_k, 100)
+        self.assertFalse(point.zero_range)
+        self.assertEqual((point.k, point.d), (0, 0))
+
+    def test_nonfinite_library_outputs_are_unavailable_and_cannot_cross(self):
+        k = np.full(20, 30.); d = np.full(20, 30.)
+        k[18] = np.nan; d[18] = np.inf; k[19] = 10.
+        with patch("market_sentinel.stochastic.talib.STOCH", return_value=(k, d)):
+            points = stochastic_14_3_3(fixed_range([50] * 20))
+        self.assertIsNone(points[18].k)
+        self.assertIsNone(points[18].d)
+        self.assertFalse(points[18].crossed_below_20)
+        self.assertFalse(points[19].crossed_below_20)
+
+    def test_direct_library_close_nan_poisons_subsequent_sma(self):
+        high = np.full(60, 110.); low = np.full(60, 10.); close = np.full(60, 60.)
+        close[25] = np.nan
+        k, d = talib.STOCH(high, low, close, 14, 3, 0, 3, 0)
+        self.assertTrue(np.isfinite(k[17:25]).all())
+        self.assertTrue(np.isnan(k[25:]).all())
+        self.assertTrue(np.isnan(d[25:]).all())
+        # Production input validation rejects NaN before invoking the library.
+        bars = fixed_range([50] * 60)
+        bars[25] = replace(bars[25], close=float('nan'))
+        with patch("market_sentinel.stochastic.talib.STOCH") as call:
+            with self.assertRaises(ValueError):
+                stochastic_14_3_3(bars)
+        call.assert_not_called()
+
+    def test_direct_library_high_low_nan_can_contaminate_later_outputs(self):
+        for field in ('high', 'low'):
+            with self.subTest(field=field):
+                values = {'high': np.full(60, 110.), 'low': np.full(60, 10.),
+                          'close': np.full(60, 60.)}
+                values[field][25] = np.nan
+                k, d = talib.STOCH(**values, fastk_period=14, slowk_period=3,
+                                   slowk_matype=0, slowd_period=3, slowd_matype=0)
+                self.assertTrue(np.isfinite(k[17:38]).all())
+                self.assertTrue(np.isnan(k[38:]).all())
+                self.assertTrue(np.isnan(d[38:]).all())
+
 
 
 if __name__ == "__main__":

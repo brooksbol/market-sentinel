@@ -13,11 +13,12 @@ This concise roadmap is explicitly requested by the Principal; it does not creat
 ## Current baseline
 
 - Repository foundation and standalone Pushover transport-test CLI implemented at `d5c49ec6f6a81b1218b16162cac73ee67323a427`.
-- Codex reported 20 deterministic offline tests passing on Python 3.14.10.
+- Production indicator mathematics now use TA-Lib Python/C 0.8.3 (Principal-selected); NumPy is a transitive dependency. Python 3.14 macOS arm64 wheel installation is verified.
 - Operator reported a successful authorized live Mac → Keychain → Pushover → iPhone test and confirmed the received message by screenshot.
 - Unattended Keychain access and locked-phone/background presentation remain unverified.
-- No Alpaca acquisition, indicators, event persistence, daily monitoring receipt, or scheduler implemented at this baseline.
-- The proposed next slice is **offline Stochastic(14,3,3) with synthetic fixtures**; confirm actual authorization and repository state before implementation.
+- Pure Stochastic was implemented at `d086ff27863a78d90d59509a49fa187737c6f902`; the bounded TA-Lib migration is verified by independent numerical fixtures and library-convention tests. See README for explicit warm-up, zero-range and precision differences.
+- No market-data acquisition, RSI, event persistence, daily monitoring receipt, or scheduler is implemented. TA-Lib adoption does not authorize subsequent slices.
+- TradingView comparison is no longer mandatory. Independent numerical fixtures and later real-data/session validation supply acceptance evidence.
 
 ## Incremental milestones
 
@@ -26,9 +27,9 @@ The sequence below is a working plan, not a collection of pre-authorized develop
 | Slice | Goal and acceptance evidence | Exclusions / dependency |
 | --- | --- | --- |
 | 0 — Transport proof | **Complete:** fixed test message accepted by Pushover and operator-confirmed on iPhone; offline tests. | Does not establish unattended execution or a functioning monitor. |
-| 1 — Pure Stochastic | Standard daily Stochastic(14,3,3), full-precision downward crossing of smoothed %K through 20, 14/16/18-bar warm-up, documented zero-range policy, independent offline fixtures. | No provider, live push, state, or scheduler; TradingView reference comparison is a separate acceptance gate. |
-| 2 — Pure RSI | Wilder RSI(14) and independent per-symbol/per-indicator crossing tests; document warm-up and edge cases. | No automatic trading or market-data retrieval. |
-| 3 — Data validation | Authenticate Alpaca Basic historical daily OHLC availability, entitlement, feed, adjustment policy (split-adjusted, dividend-unadjusted), completeness, calendar alignment, freshness, and comparison with TradingView on matching observations. Feed both indicators from one acquisition. | No silent provider substitution; fail visibly on missing/revised/stale bars. |
+| 1 — TA-Lib Stochastic | **Complete:** STOCH(14,3,3), explicit SMA types, full-precision K crossings and independent fixtures. Raw K is informational at 14; TA-Lib exposes K/D at 18. Exact-zero-range outputs remain unavailable through a small validity mask. | No provider, live push, state or scheduler. Numerical convention differences are documented in README; TradingView is optional. |
+| 2 — TA-Lib RSI | Future separately authorized slice: Wilder RSI(14) via TA-Lib, independent fixtures/crossings, initialization and edge-case evidence. | No custom RSI implementation, automatic trading or market-data retrieval. |
+| 3 — Data feasibility and validation | **Tradier first candidate**, not a final selection: investigate historical OHLC, entitlements, adjustments (candidate: split-adjusted/dividend-unadjusted), coverage, calendar alignment, freshness and reproducible real-data checks. Feed both indicators from one acquisition. | No integration or retrieval authorized by this plan. No silent substitution; fail visibly on missing/revised/stale bars. |
 | 4 — Durable monitoring | SQLite or another explicitly selected durable store for source provenance, runs, per-session events, notification attempts and delivery outcomes; independent re-arming, replay/catch-up, and ordinary duplicate suppression. | Exactly-once event recording cannot guarantee exactly-once push receipt. Cloud persistence choice must be decided before committing to a local SQLite deployment model. |
 | 5 — Daily receipts | One accountable logical result for every completed US trading session: 19/19 and zero signals, consolidated qualifying crossings, or explicitly degraded/incomplete. Both indicator counts, even if initially only Stochastic pushes are actionable. | Never present missing data or failure as a quiet day. |
 | 6 — Local unattended operation, if still useful | launchd approximately 18:37 America/New_York, exchange-calendar handling including holidays/early closes, startup/wake catch-up, and verified unattended secret access. | Mac can be asleep; catch-up delay is accepted. No GitHub Actions scheduler. |
@@ -70,4 +71,4 @@ The pilot should provide *documented evidence* about reproducible deployment, se
 - Whether local launchd remains necessary after a successful cloud monitor pilot.
 - Exact operational acceptance thresholds and alert escalation for missed receipts.
 
-**Next bounded engineering action:** complete or verify the separately authorized offline Stochastic slice. **Next cloud decision:** authorize a narrowly scoped, manually invoked, fixed-message cloud transport proof when ready. Do not begin either merely because it appears here.
+**Next proposed engineering slice:** separately authorize TA-Lib RSI with independent offline fixtures. **Next data investigation:** Tradier historical-data feasibility, by separate assignment. **Next cloud decision:** a narrowly scoped, manually invoked, fixed-message cloud transport proof when ready. None is authorized merely by this roadmap.

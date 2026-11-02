@@ -5,10 +5,10 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "market-sentinel"
 version = "0.1.0"
-description = "Independent daily equity-indicator monitoring utility; initial push proof"
+description = "Independent technical-indicator monitoring utility using TA-Lib"
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = ["TA-Lib==0.8.3"]
 
 [project.scripts]
 market-sentinel = "market_sentinel.__main__:main"
