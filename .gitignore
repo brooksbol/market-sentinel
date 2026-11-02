@@ -1,0 +1,36 @@
+# Python and packaging
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.python-version
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
+.coverage*
+htmlcov/
+
+# Credentials and local configuration (never commit real values)
+.env
+.env.*
+*.env
+secrets/
+credentials/
+*.pem
+*.key
+config.local.*
+
+# Runtime state belongs outside the checkout; ignore accidental local copies
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.log
+logs/
+runtime/
+.local/
+.DS_Store
