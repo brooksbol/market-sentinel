@@ -6,10 +6,12 @@ never authorize or execute a trade.
 
 ## Current scope
 
-Repository foundation and a bounded Pushover transport proof. The market monitor
-is **not implemented**: no market-data connection, indicators, database, daily
-receipt or installed scheduler exists. This project has no Wheelwright runtime,
-deployment, credential or Product dependency.
+Repository foundation, a bounded Pushover transport proof, and pure standard
+Stochastic(14,3,3) calculation with adjacent-session crossing detection. The market
+monitor is **not implemented**: no market-data connection, RSI, database, durable
+events, daily receipt or installed scheduler exists. Stochastic results are not
+connected to Pushover. This project has no Wheelwright runtime, deployment,
+credential or Product dependency.
 
 ## Environment and development
 
@@ -137,9 +139,127 @@ credentials as arguments, and argument errors do not echo supplied arguments.
 Tests mock HTTP and Keychain using synthetic credentials, including successful
 request construction, rejected credentials, malformed/provider errors, timeout,
 safe diagnostics, explicit send intent and CLI exit status. No live push is needed
-for code-level completion. Future acceptance adds offline indicator fixtures,
-TradingView comparison, synthetic crossings, independent identities, deduplication,
-re-arming, missed-session recovery, all-symbol data validation, then scheduling.
+for code-level completion. Stochastic fixtures and pure crossings are implemented
+below. Future acceptance includes TradingView comparison, RSI, durable identities,
+deduplication, missed-session recovery, all-symbol data validation, then scheduling.
+
+## Stochastic(14,3,3) — implemented, offline-tested
+
+Public API in `market_sentinel.stochastic`:
+
+```python
+from datetime import date, timedelta
+from market_sentinel.stochastic import DailyOHLC, crossed_below_20, stochastic_14_3_3
+
+# Illustrative caller-supplied sessions, not real market observations/calendar.
+bars = [
+    DailyOHLC(date(2026, 1, 1) + timedelta(days=i), open=60, high=110, low=10, close=60)
+    for i in range(18)
+]
+points = stochastic_14_3_3(bars)
+assert (points[-1].raw_k, points[-1].k, points[-1].d) == (50, 50, 50)
+assert crossed_below_20(20, 19.999999999) is True
+```
+
+`DailyOHLC(session, open, high, low, close)` and returned `StochasticPoint` are
+immutable dataclasses. The calculation accepts an iterable and returns a tuple
+with one point for every input session, including warm-up. Each point contains
+`session`, `raw_k`, smoothed `k`, `d`, `crossed_below_20` and `zero_range`.
+Empty input returns `()`.
+
+For each session, raw K is `100 * (close - lowest_low) / (highest_high - lowest_low)`
+over that session and the preceding 13 supplied sessions. K is the three-value
+simple mean of raw K; D is the three-value simple mean of K. Implementation divides
+the price difference before multiplying by 100 to avoid unnecessary overflow, and
+uses `math.fsum` for the small SMA sums. There is no explicit rounding, EMA,
+Wilder smoothing or Stochastic RSI calculation.
+
+| Value | First available observation (one-based) |
+|---|---|
+| Raw K | 14 |
+| Smoothed K | 16 |
+| D | 18 |
+| Possible K crossing | 17; D is not required |
+
+**Unavailable and zero-range policy:** insufficient warm-up is `None`, never zero.
+If the 14-session high equals its low, raw K is also `None`, with `zero_range=True`
+on that point. Warm-up points have `zero_range=False`. Smoothing requires three
+consecutive available inputs: an undefined raw value invalidates affected K and D
+windows until new valid windows exist. The detector never bridges unavailable K.
+Constant OHLC therefore stays unavailable; constant closes within a nonzero OHLC
+range can produce a valid number. This explicit flat-window policy is not yet
+verified against TradingView's handling of undefined values.
+
+**Input contract:** all observations describe one security, already completed and
+on one consistent adjustment basis. Session identity must be `datetime.date`, not
+a string or `datetime.datetime`, and must strictly increase without duplicates.
+OHLC fields must be finite Python `int` or `float` values (booleans and numeric
+strings are rejected), representable as finite floats, with
+`0 < low <= open/close <= high`. Calculations use binary floating-point values;
+no corporate-action adjustment or display rounding is applied. Invalid supplied
+records/values/order raise `ValueError`; omitting a required dataclass constructor
+argument raises `TypeError`. No partially calculated result is returned.
+
+**Coverage belongs to the caller:** this module does not infer session completion,
+market holidays or whether a date gap is an omitted trading session. The caller
+must supply contiguous completed trading sessions or reject incomplete coverage
+before calling. A supplied missing record/field value is rejected; nothing is
+sorted, filled, skipped or interpolated. Revisions require explicitly supplying
+the corrected observations and recomputing; prior results are not mutated.
+
+**Crossings:** `crossed_below_20(previous, current)` returns true only for unrounded
+`previous >= 20 and current < 20`. Missing values return false; supplied nonfinite
+or out-of-range oscillator values raise `ValueError`. Each output's flag compares
+only the immediately preceding point's K with current K. Raw K and D never trigger
+it. Consecutive below-20 values do not repeat; recovery to exactly 20 or above
+allows a later crossing. This is a pure adjacent-value result, not a durable event,
+notification, re-arming store or deduplication mechanism.
+
+### Numerical evidence
+
+The complete offline suite includes 30 Stochastic/crossing tests and 20 existing
+Pushover tests. Expected values come from hand-derived fixtures, not a second
+indicator implementation. With every bar's range [10,110], closes `10+x` give
+raw K exactly `x` mathematically. The test reference raw sequence
+`30,60,90,30,0,0,0,60,0,0,0` gives K
+`None,None,60,60,40,10,0,20,20,20,0`; D first becomes `160/3`, then `110/3`.
+Separate fixtures force independent rolling-high/low eviction and verify rising,
+falling, oscillating, zero-range, recovery and near-20 behavior. Prefix comparisons
+check that later observations cannot change earlier results.
+
+### TradingView comparison — pending operator-supplied reference
+
+Formula reference: [TradingView's standard Stochastic definition and settings](https://www.tradingview.com/support/solutions/43000502332-stochastic-stoch/).
+Synthetic tests do **not** establish TradingView equivalence. No TradingView data
+was scraped, account created, or live market data acquired for this slice.
+
+Reproducible manual comparison:
+
+1. Select the exact exchange/listing and ordinary candlestick **1D** chart in
+   TradingView. Add **Stochastic (STOCH)**, not Stochastic RSI. Set K/lookback **14**,
+   Smooth K **3**, D **3**, indicator timeframe **1D/chart**. Reference lines 80/20
+   are display settings; only K crossing below 20 is relevant here.
+2. Fix regular-session and split/dividend-adjustment conventions. Obtain matching
+   H/L/C from the same chart source; never mix adjusted close with raw H/L. Capture
+   O as well for input validation. Use only completed sessions, oldest first.
+3. Manually supply at least **19 consecutive completed bars** and the displayed K/D
+   for the last two sessions (use chart export only if already available to the
+   operator). Record exchange, dates, settings, precision and observation values.
+   No automated TradingView access is needed or commissioned.
+4. Construct `DailyOHLC` values and run `stochastic_14_3_3` offline. Compare the last
+   two K/D values and the exact K crossing. Eighteen valid bars suffice for one
+   fully warmed D; nineteen provide two fully warmed reference points.
+5. With identical full-precision inputs, investigate differences above **1e-8
+   oscillator units**. For rounded chart displays, account for half the last shown
+   decimal unit as display uncertainty. Display agreement near 20 cannot prove a
+   crossing: seek sufficient source precision or leave the classification pending.
+   Never use validation tolerance as a different trading threshold.
+
+Outstanding compatibility checks: flat-window/undefined-value handling (including
+whether smoothing skips undefined values), initial partial-window behavior,
+floating-point summation differences, chart price precision and corporate-action
+adjustment conventions. Early warm-up is deliberately the strict 14/16/18 contract
+above even if a reference platform displays earlier partial-window values.
 
 ## Intended monitor — requirements, not implemented
 
@@ -163,9 +283,10 @@ Fixed initial universe:
   only. Higher expected event frequency is an operational-testing hypothesis,
   not evidence of better acquisition performance. RSI remains a separate
   acquisition-signal hypothesis. Any historical strategy study is a separate task.
-- Resolve warm-up, zero-range/zero-gain-loss and missing-value behavior explicitly
-  in offline fixtures. Validate against TradingView's regular 1D indicators with
-  matching data and adjustment settings before operational acceptance.
+- Stochastic warm-up, zero-range and supplied-invalid-data policies are implemented
+  above. RSI conventions and calendar coverage validation remain future work.
+  Validate against TradingView's regular 1D indicators with matching observations
+  and adjustment settings before operational acceptance.
 
 **Data:** Alpaca Basic historical SIP daily OHLC is the candidate, subject to
 authenticated coverage, entitlement, freshness and TradingView validation. Acquire
