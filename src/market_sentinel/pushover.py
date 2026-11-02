@@ -70,9 +70,14 @@ def send_test_push(token: str, user_key: str) -> None:
     A timeout is ambiguous: Pushover may have accepted the request. No automatic
     retry is made, and no phone-delivery claim is inferred from API acceptance.
     """
+    _send_message(token, user_key, TITLE, MESSAGE)
+
+
+def _send_message(token: str, user_key: str, title: str, message: str) -> None:
+    """Shared private transport; callers own explicit authorization and payloads."""
     _validate_credentials(token, user_key)
-    body = urlencode({"token": token, "user": user_key, "title": TITLE,
-                      "message": MESSAGE}).encode("ascii")
+    body = urlencode({"token": token, "user": user_key, "title": title,
+                      "message": message}).encode("ascii")
     request = Request(ENDPOINT, data=body, method="POST", headers={
         "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
         "User-Agent": "Market-Sentinel-Transport-Test/0.1",
