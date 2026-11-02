@@ -7,9 +7,10 @@ never authorize or execute a trade.
 ## Current scope
 
 Repository foundation, a bounded Pushover transport proof, and pure standard
-Stochastic(14,3,3) calculation with adjacent-session crossing detection. The market
-monitor is **not implemented**: no market-data connection, RSI, database, durable
-events, daily receipt or installed scheduler exists. Stochastic results are not
+Stochastic(14,3,3) calculation with adjacent-session crossing detection, plus a
+bounded read-only Tradier daily-history proof. The market monitor is **not
+implemented**: no RSI, database, durable events, daily receipt or installed
+scheduler exists. Authenticated Tradier retrieval remains blocked on operator setup. Stochastic results are not
 connected to Pushover. This project has no Wheelwright runtime, deployment,
 credential or Product dependency.
 
@@ -285,6 +286,162 @@ Upstream sources checked November 2, 2026:
 [STOCH C implementation](https://github.com/TA-Lib/ta-lib/blob/v0.8.3/src/ta_func/ta_STOCH.c),
 [scaled-zero guard](https://github.com/TA-Lib/ta-lib/blob/v0.8.3/src/ta_func/ta_utility.h).
 
+## Tradier daily-history feasibility — implemented, live verification blocked
+
+This is an explicitly invoked **three-symbol acquisition proof**, not a monitor.
+It uses only `GET /v1/markets/history` for CLX, CVX and MCD. No account, order,
+options, Pushover or scheduling operation occurs. No new dependency was added.
+HTTP/JSON use the standard library; calculation uses the existing TA-Lib code.
+
+### Interfaces and data contract
+
+- `market_sentinel.tradier.load_token(environment)` retrieves credentials separately.
+- `fetch_history(token, *, symbol, environment, start, end, completed_through)`
+  performs one HTTPS GET. Production and sandbox have fixed, distinct endpoints.
+  Dates are `datetime.date`; explicit ranges are bounded to 366 calendar days.
+- `normalize_history(payload, *, symbol, environment, start, end, completed_through)`
+  is independently testable without HTTP. It returns immutable `History`: request
+  metadata, chronological `DailyOHLC` bars, aligned optional volumes, excluded
+  session dates and a flag identifying provider reordering.
+- `market_sentinel.tradier_report.history_report(history)` supplies normalized OHLC
+  to `stochastic_14_3_3` and produces a JSON-compatible informational report.
+  It reports coverage, cutoff staleness, exclusions, latest close/K/D/crossing and
+  historical crossings with prior/current K, D, close and date. Crossings before
+  TA-Lib warm-up are unavailable; this is not complete lifetime signal history.
+
+The client explicitly supplies `symbol`, `interval=daily`, `start` and `end`, with
+Bearer authorization and JSON acceptance. Normal TLS verification, no redirects
+or ambient proxies, 15-second network timeout and a 1 MB response cap apply. No
+automatic retries. Authentication/entitlement rejection, HTTP failure, timeout,
+malformed JSON, empty history and rate limits fail with sanitized messages.
+Tradier's documented HTTP **400** `Quota Violation` and conventional **429** are
+both recognized; provider bodies, headers and tokens are never printed.
+
+All rows are validated before use, including excluded rows. Singleton `day`
+objects and arrays are supported. Rows are sorted explicitly, not silently kept
+in provider order. Duplicate dates, malformed/nonfinite/nonpositive OHLC, unsafe
+TA-Lib magnitudes, prices outside low/high, out-of-range dates and weekend dates
+reject the entire response. Supplied volume must be finite and nonnegative;
+missing/null volume stays `None` and is listed in the report. No prices are filled,
+interpolated, substituted or additionally adjusted.
+
+**Completed-session cutoff:** the caller certifies `completed_through`; later rows
+are excluded before calculation. API presence is not evidence of completion.
+The proof CLI conservatively requires the requested end and cutoff to predate
+today in `America/New_York`, even after today's close. The lower-level API permits
+an explicitly certified same-day cutoff for future research, but does not certify
+it itself. The CLI cutoff must identify the intended latest completed session,
+not a weekend date. A last bar earlier than cutoff or unavailable latest K/D is
+reported as degraded and produces exit 1. Continuity is **always unverified** in
+this slice: there is no exchange calendar, so omitted weekdays cannot be labeled
+missing sessions or holidays, and weekday holiday rows cannot be independently
+identified. Calculations on supplied bars are provisional, not operational acceptance.
+
+### Secure operator setup
+
+Never paste a token into chat, a repository file, command argument, issue or log.
+Use an **existing** Tradier account's [API Settings](https://web.tradier.com/user/api)
+to obtain its production token. This software creates no accounts or subscriptions.
+Personal tokens grant **full account access**, persist until regenerated, and
+cannot be reduced to market-data-only scopes through the personal-token flow.
+Partner OAuth has scopes; this slice does not implement OAuth. Code is restricted
+to the history endpoint, but that does not reduce the credential's underlying power.
+Do not distribute the operator's token with this public source code.
+
+Prefer Keychain Access → login → File → New Password Item:
+
+| Service/item name | Account | Password |
+|---|---|---|
+| `market-sentinel.tradier` | `production-token` | Your production token |
+| `market-sentinel.tradier` | `sandbox-token` | Your sandbox token, only if separately testing sandbox |
+
+These identifiers are independent of Pushover. Retrieval has a 15-second timeout;
+macOS may require the operator to allow access. A portable alternative is
+`TRADIER_TOKEN` injected securely at runtime. It overrides Keychain, including
+rejecting an empty value. Select its matching environment explicitly; sandbox
+and production tokens are not interchangeable. For an interactive zsh handoff:
+
+```sh
+(
+  set +x
+  read -rs 'TRADIER_TOKEN?Tradier production token (hidden): '
+  printf '\n'
+  export TRADIER_TOKEN
+  # Run the authorized report command below here, within this subshell.
+)
+```
+
+Actual secrets never appear in the command text. Environment handoff is visible
+potentially to privileged local processes; Keychain is preferable locally. A
+future cloud job may inject the variable through a managed secret, without macOS.
+Rotate exposed credentials in Tradier, update Keychain and unset stale overrides.
+Do not grant broad Keychain access merely to avoid reviewing prompts.
+
+### Offline and explicitly authorized live procedure
+
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/python -m market_sentinel.tradier_report --help
+# Safe: no --fetch, so no credentials read and no network; exit 2.
+.venv/bin/python -m market_sentinel.tradier_report --environment production \
+  --start 2026-02-01 --end 2026-10-30 --completed-through 2026-10-30
+```
+
+Only after provider setup and operator authorization, append `--fetch` to that
+last command. The February–October range targets approximately 100–200 completed
+sessions, not a fixed count of weekdays. For later dates, explicitly choose a
+known completed exchange session and preceding range; this proof does not guess
+holidays. The current assignment authorizes this bounded read-only verification,
+not recurring use or expansion to 19 symbols. No notification is sent. Output is
+labeled **Informational market-data and indicator verification — not a trading
+recommendation.** Inspect it locally; do not commit raw live responses or personal
+operating reports. The report adds a UTC evidence timestamp; underlying numerical
+results are deterministic for identical normalized observations/library version.
+
+Exit 0 means all three reports calculated without cutoff staleness or missing
+latest K/D, **not** verified calendar continuity or provider finality. Exit 1 means
+setup, acquisition, calculation or stale/undefined-result failure. Exit 2 means
+missing fetch intent or invalid arguments. Acquisition failure stops further
+requests and explicitly marks remaining symbols unattempted. Partial results
+cannot masquerade as a fully successful run.
+
+### Evidence and remaining provider questions
+
+On November 2, 2026, **100 offline tests passed** (60 existing plus 40 new),
+including mocked HTTP/Keychain, hand-derived Stochastic integration, safe CLI
+behavior and unchanged Pushover regressions. Editable and fresh non-editable
+package installations passed; all 100 tests also passed outside the checkout in
+the fresh environment. `pip check` passed on Python 3.14.10/macOS arm64. No dependency requirements
+changed; Python 3.12 and other platforms were not executed for this slice.
+
+The authorized production command failed during credential
+retrieval: no `TRADIER_TOKEN` handoff was present and the designated production
+Keychain item was unavailable. **No Tradier HTTP requests were sent.** Actual
+CLX/CVX/MCD OHLC coverage, prices, Stochastic values and entitlements therefore
+remain unverified. Offline fixtures do not substitute for this evidence.
+
+Official documentation checked November 2, 2026:
+[history parameters/adjustments](https://docs.tradier.com/market-data/get-historical-pricing),
+[authentication/token permissions](https://docs.tradier.com/docs/authentication),
+[environments/personal-use access](https://docs.tradier.com/),
+[rate limits](https://docs.tradier.com/overview/rate-limits).
+Daily history is documented as split-adjusted and dividend-unadjusted; no
+additional adjustment is applied. Consistency across all OHLC fields and actual
+corporate-action revisions remain to be empirically checked. API access is
+included with an existing brokerage account; personal access is for personal use.
+No new account, entitlement or subscription has been obtained or cost verified.
+Production market-data limit: 120 requests/minute/token; sandbox: 60. The proof
+makes at most three sequential requests and stops on acquisition failure. Sandbox
+market data is delayed 15 minutes and cannot establish production bar freshness.
+
+No published daily-bar finalization deadline/completeness flag was found in the
+reviewed endpoint documentation. A stale/missing response is a failure, not a
+non-event. Late/revised data, full session coverage, early closes, adjustment
+behavior and reconciliation remain future acceptance work. Tradier remains a
+**candidate**, not the selected permanent source. The close-relative timing study
+(+1/+5/+10/+15/+30 minutes, 18:37 ET and next-session 09:31 ET) is not implemented
+or executed here; current CLI intentionally excludes same-day requests.
+
 ## Intended monitor — requirements, not implemented
 
 Keep scheduling, data acquisition, pure indicator calculations, crossing
@@ -311,8 +468,8 @@ Fixed initial universe:
   also use TA-Lib in a separate slice. Independent numerical fixtures and later
   real-data/session validation are required; TradingView comparison is optional.
 
-**Data:** Tradier is the first candidate for a separately authorized market-data
-feasibility investigation, not a final provider selection or integration. Establish
+**Data:** Tradier is the first candidate. A bounded history proof is implemented
+above; live verification is blocked on credentials, and provider selection is not final. Establish
 historical OHLC availability, entitlement, adjustments, coverage and freshness. Acquire
 once for both indicators. Use only completed US equity sessions; handle holidays,
 early closes, DST, missing/duplicate bars and revised history. Apply consistent
