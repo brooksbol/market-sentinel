@@ -163,8 +163,20 @@ def fetch_history(token: str, *, symbol: str, environment: str,
     _token(token)
     if not isinstance(symbol, str) or not re.fullmatch(r"[A-Z]{1,5}", symbol):
         raise TradierError("Use one uppercase equity symbol.")
-    query = urlencode(dict(symbol=symbol, interval="daily", start=start.isoformat(), end=end.isoformat()))
-    request = Request(BASES[environment] + "?" + query, method="GET", headers={
+    payload = _get_json(token, environment, "history", dict(
+        symbol=symbol, interval="daily", start=start.isoformat(), end=end.isoformat()))
+    return normalize_history(payload, symbol=symbol, environment=environment,
+                             start=start, end=end, completed_through=completed_through)
+
+
+def _get_json(token, environment, endpoint, parameters):
+    """Shared bounded GET, restricted to history/calendar market-data endpoints."""
+    _environment(environment)
+    _token(token)
+    if endpoint not in ("history", "calendar"):
+        raise TradierError("Unsupported market-data endpoint.")
+    url = BASES[environment].rsplit("/", 1)[0] + "/" + endpoint
+    request = Request(url + "?" + urlencode(parameters), method="GET", headers={
         "Authorization": "Bearer " + token, "Accept": "application/json",
         "User-Agent": "Market-Sentinel-History-Proof/0.1"})
     opener = build_opener(ProxyHandler({}), _NoRedirects())
@@ -193,5 +205,4 @@ def fetch_history(token: str, *, symbol: str, environment: str,
         payload = json.loads(raw)
     except (ValueError, UnicodeError, RecursionError):
         raise TradierError("Malformed Tradier JSON response.") from None
-    return normalize_history(payload, symbol=symbol, environment=environment,
-                             start=start, end=end, completed_through=completed_through)
+    return payload

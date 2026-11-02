@@ -15,15 +15,17 @@ Implemented: standalone Pushover test transport, TA-Lib Stochastic(14,3,3), pure
 crossing detection, and an explicitly invoked Tradier report for all 19 configured
 symbols. Range inconsistencies produce structured warnings without price repair.
 A pure full-universe formatter and explicitly authorized one-message Pushover
-report are also implemented. RSI, persistence, durable deduplication, automatic
-actionable alerts and scheduled daily delivery remain unimplemented. This is
+report are also implemented. Local twice-daily launchd delivery is now commissioned
+and implemented, with a protected report-delivery ledger and wake/startup catch-up.
+RSI, SQLite monitoring/event persistence and automatic actionable alerts remain
+unimplemented. This is
 independent of Wheelwright's runtime, credentials and Product boundaries.
 
 ## Environment and development
 
 Target: macOS, a maintained Python **3.12 or later**, and an iPhone with Pushover.
 Offline tests can run on other Python-supported operating systems. macOS Keychain
-integration and the eventual launchd installation are macOS-specific.
+integration and the local launchd installation are macOS-specific.
 
 Use a separately installed maintained Python, not an obsolete system Python:
 
@@ -264,8 +266,8 @@ send_daily_report(token, user_key, screening, demonstration=True)
 ```
 
 API acceptance does not confirm phone receipt. A timeout can follow acceptance;
-check the phone before authorizing another attempt. There is no automatic retry,
-deduplication or delivery schedule. The older fixed `push-test` and three-message
+check the phone before authorizing another attempt. This explicit-send helper has no automatic retry,
+deduplication or delivery schedule; the separate local worker below owns scheduled delivery. The older fixed `push-test` and three-message
 historical `demo_push` remain separate, tested commands; the latter is preserved
 as a demonstration fixture, not the daily report product. Earlier RETEST receipt,
 locked-screen display and audible delivery were independently operator-confirmed.
@@ -482,10 +484,11 @@ can accept a separately certified same-day cutoff; it does not establish finalit
 **Calendar continuity is not implemented in the command.** Its report says
 unverified; omitted weekdays cannot be distinguished from exchange holidays.
 `complete` describes batch processing, not independent exchange-calendar proof.
-Coverage is checked separately for the bounded live acceptance evidence. Daily-bar
-publication timing, early-close handling and revision reconciliation remain
-future monitoring work; 09:31/16:01 ET are research observation times, not validated
-production evaluation times. No timing study or recurring polling is installed.
+Coverage is checked separately for the bounded manual evidence. The automatic
+worker below now verifies calendar continuity and regular-session close times.
+Same-day publication latency and finality remain unproven: a missing bar delays
+the closing report rather than substituting an earlier session. No multi-session
+timing study is installed.
 
 ### Secure setup and operation
 
@@ -601,14 +604,109 @@ does not imply exactly-once notification delivery.
 eventually have one accountable report containing all 19 symbols, ordered by
 ascending unrounded Stochastic K, regardless of crossing activity. This replaces
 the generic keep-alive. Explicit single-message formatting/delivery is implemented
-above; durable per-session progress and automatic delivery are not. Actionable new
+above; the local worker below adds a delivery ledger and automatic twice-daily delivery. Actionable new
 crossing alerts remain a separate product. Incomplete evaluation must not be
 presented as successful zero signals. Future state must retain failures, retries
 and revisions; exactly-once phone delivery is not promised.
 
-**Scheduling:** eventual macOS launchd invocation around 18:37 America/New_York,
-with wake/startup catch-up. The monitor, not the scheduler, owns session selection,
-calculation and persistence. Catch-up delay while the Mac is off is accepted.
+**Scheduling:** the Principal superseded the proposed 18:37 window with opening
+and closing checks at approximately 09:31 and 16:01 Eastern, with wake/startup
+catch-up. This local report scheduling is implemented below. Catch-up delay while
+the Mac is off is accepted; actionable alerts remain unimplemented.
+
+## Automatic opening and closing reports — local macOS operation
+
+The Principal explicitly authorized activation on November 2, 2026. This is a
+local **LaunchAgent**, not cloud hosting. The operator must be logged into the
+Mac; sleep or power-off delays delivery until wake/login. No always-on promise
+is made. There are **two full-universe reports per regular trading day**:
+
+- **Opening, open +1 minute (normally 09:31 America/New_York):** uses the previous
+  completed session, never the current intraday bar. It also recalculates that
+  session from freshly retrieved history, so overnight corrections may be visible.
+- **Closing, close +1 minute (normally 16:01 Eastern):** uses that day's completed
+  regular session. Early closes follow Tradier's regular-session calendar (for
+  example 13:01 Eastern). Holidays/weekends generate no new report slots.
+
+Every report identifies the observation date/type and the completed **data session**.
+The crossing count concerns that data session, not newly delivered event alerts;
+opening and the previous closing report can describe the same crossing. This does
+not activate event-driven actionable notifications. K/D math, thresholds, warning
+policy, sound and priority are unchanged.
+
+`market_sentinel.scheduled_report` separates due-slot selection, acquisition,
+formatting and sending. `launchd` checks once per minute while awake, with
+`RunAtLoad` and calendar ticks coalesced on wake. These ticks are **local checks**,
+not one market-data request per minute. Eastern `ZoneInfo` handles DST independently
+of the Mac's time zone. Tradier's `/v1/markets/calendar` supplies regular sessions;
+complete month responses are validated, historical months cached, and the current
+month refreshed daily. No assumed weekday calendar fills omitted bars.
+
+For a due slot, the worker retrieves 270 calendar days (roughly 185 trading bars)
+for each of the 19 symbols, one history request each. It verifies exact session
+coverage against the cached exchange calendar and requires usable latest K/D and
+adjacent comparisons before sending one complete report. Finite range warnings
+stay visible. It never sends a stale/partial substitute. Data, credential or
+preflight failure is recorded and checked again after 15 minutes; publication at
+16:01 is **not guaranteed**. Appearing after the regular close establishes the
+session cutoff, not that a provider can never revise its bar. Accepted closing
+reports are not resent on later corrections.
+
+Runtime files are protected (directory 0700, files 0600) outside the checkout:
+
+`~/Library/Application Support/Market Sentinel/automatic-reports/`
+
+- `state.json`: activation date, cached calendars and per-observation delivery
+  intent/acceptance. **Preserve this file**; deleting/resetting it can duplicate
+  reports or lose recovery history. This small report ledger is not the planned
+  SQLite event/monitoring subsystem.
+- `YYYY-MM-DD-opening.json` / `...-closing.json`: evaluated screening evidence.
+- `worker.log` (bounded, one rotated predecessor) and `launchd.log`: sanitized
+  diagnostics. `last_failure` in status distinguishes delayed/failed acquisition
+  from a quiet successful report; this slice has no independent failure-push service.
+
+A nonblocking file lock prevents overlapping workers. Missed slots since activation
+are recovered chronologically, at most **one report per minute**, without silently
+skipping days. Intent is atomically persisted/fsynced **before** push HTTP; accepted
+slots are never ordinarily resent. A crash during send, timeout, rejection or other
+push failure leaves that slot unknown and **does not automatically retry**. Inspect
+the phone and ledger before separately authorizing manual reconciliation. Subsequent
+slots remain independent. API acceptance never proves phone receipt. Local storage
+failure or missing/locked Keychain can still require operator attention.
+
+Inspect operation (no notifications sent by `--status`):
+
+```sh
+.venv/bin/python -m market_sentinel.scheduled_report --status
+launchctl print gui/$(id -u)/com.market-sentinel.daily-reports
+```
+
+Explicit installation/activation, only after operator authorization:
+
+```sh
+.venv/bin/python -m market_sentinel.scheduled_report --install
+```
+
+Installation refuses to overwrite an existing ledger or LaunchAgent. It creates
+`~/Library/LaunchAgents/com.market-sentinel.daily-reports.plist`, referencing this
+checkout's absolute virtual-environment Python and working directory; no secrets
+are in the plist. Keep the checkout/venv at that location. The worker uses the
+existing protected Keychain credentials, with no account/order endpoints or new
+credentials. It sends only scheduled universe reports, with unchanged Pushover
+settings. To stop, preserving the ledger:
+
+```sh
+launchctl bootout gui/$(id -u)/com.market-sentinel.daily-reports
+```
+
+To resume the preserved installation, use `launchctl bootstrap gui/$(id -u)` with
+the existing plist path (rather than `--install`). A future cloud deployment and
+SQLite/event deduplication remain separate decisions. Offline tests cover calendar
+validation, holiday/early-close/DST boundaries, chronological replay, full coverage,
+stale-data delay, accepted/ambiguous sends, intent-before-HTTP, locking and secret
+redaction. [Tradier calendar](https://docs.tradier.com/market-data/get-market-calendar)
+and the installed macOS `launchd.plist(5)` wake semantics were verified November 2,
+2026. No data publication SLA is inferred.
 
 ## Security and operational boundaries
 
