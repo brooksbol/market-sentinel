@@ -562,7 +562,7 @@ Official references:
 [authentication](https://docs.tradier.com/docs/authentication),
 [rate limits](https://docs.tradier.com/overview/rate-limits).
 
-## Intended monitor — requirements, not implemented
+## Remaining monitor requirements
 
 Keep scheduling, data acquisition, pure indicator calculations, crossing
 detection, persistence and notification transport independently replaceable.
@@ -707,6 +707,15 @@ stale-data delay, accepted/ambiguous sends, intent-before-HTTP, locking and secr
 redaction. [Tradier calendar](https://docs.tradier.com/market-data/get-market-calendar)
 and the installed macOS `launchd.plist(5)` wake semantics were verified November 2,
 2026. No data publication SLA is inferred.
+
+**Activation verified November 2, 2026:** the installed LaunchAgent completed its
+first unattended run with exit 0. Existing Keychain credentials were accessible,
+ten calendar months were validated, and all 19 production histories contained
+189 matching sessions through October 30. The opening catch-up report had zero
+new crossings and 13 sample warnings (zero on session), fit in 712 ASCII
+characters/UTF-8 bytes, and was accepted by Pushover. This verifies launchd-to-API
+operation; phone receipt for this newly automatic report still requires independent
+operator confirmation. Future closing-bar publication time remains unverified.
 
 ## Security and operational boundaries
 
