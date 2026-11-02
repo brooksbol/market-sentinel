@@ -47,7 +47,7 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(len(symbols), 19)
         self.assertEqual(set(symbols), set(SYMBOLS))
         self.assertEqual(len(symbols), len(set(symbols)))
-        self.assertIn("19/19 | Stoch 14,3,3", body)
+        self.assertIn("19/19 evaluated", body)
         self.assertNotIn(daily_report.TITLE, body)
 
     def test_full_precision_sort_precedes_display_rounding(self):
@@ -56,7 +56,7 @@ class FormatTests(unittest.TestCase):
         report["results"][1]["latest"]["k"] = 5.041  # O, same displayed 5.0
         rows = row_lines(daily_report.format_daily_report(report))
         self.assertEqual([line.split()[0] for line in rows[:2]], ["O", "CLX"])
-        self.assertEqual([line.split()[2] for line in rows[:2]], ["5.0", "5.0"])
+        self.assertEqual([line.split()[2] for line in rows[:2]], ["5", "5"])
 
     def test_symbol_breaks_exact_ties_independent_of_input_order(self):
         report = screening()
@@ -67,16 +67,16 @@ class FormatTests(unittest.TestCase):
         self.assertEqual(first, daily_report.format_daily_report(report))
         self.assertEqual([line.split()[0] for line in row_lines(first)], sorted(SYMBOLS))
 
-    def test_known_close_k_d_display_and_column_alignment(self):
+    def test_known_close_score_state_display_and_column_alignment(self):
         report = screening()
         target = next(row for row in report["results"] if row["symbol"] == "ADM")
         target["latest"].update(close=76.91, k=7.006803452414438, d=5.795976047115096)
         target = next(row for row in report["results"] if row["symbol"] == "CAT")
         target["latest"].update(close=622.75, k=12.693158708717277, d=17.037625449216605)
         rows = row_lines(daily_report.format_daily_report(report))
-        self.assertEqual(rows[0].split(), ["ADM", "76.91", "7.0", "5.8"])
-        self.assertEqual(rows[1].split(), ["CAT", "622.75", "12.7", "17.0"])
-        self.assertEqual(len({len(line) for line in rows}), 1)
+        self.assertEqual(rows[0].split(), ["ADM", "76.91", "7", "Oversold"])
+        self.assertEqual(rows[1].split(), ["CAT", "622.75", "13", "Oversold"])
+        self.assertEqual(len({line.rfind(line.split()[-1]) for line in rows}), 1)
 
     def test_crossing_and_oversold_are_distinct_full_precision_counts(self):
         report = screening()
@@ -85,8 +85,8 @@ class FormatTests(unittest.TestCase):
         report["results"][2]["latest"].update(k=20, crossed_below_20=False)
         report["summary"]["new_downward_crossings"] = 1
         body = daily_report.format_daily_report(report)
-        self.assertIn("Crossings: 1 | Below 20: 2", body)
-        self.assertIn("20.0", body)  # Rounded presentation never changes the below count.
+        self.assertIn("Crossings: 1 | Oversold: 2", body)
+        self.assertIn("20 Oversold", body)  # Rounded presentation never changes the below count.
 
     def test_complete_demo_fits_and_explicitly_is_not_scheduled(self):
         body = daily_report.format_daily_report(screening(), demonstration=True)
@@ -119,7 +119,7 @@ class FormatTests(unittest.TestCase):
 
     def test_missing_invalid_and_nonfinite_numerical_values_rejected(self):
         for field in ("close", "k", "d"):
-            for value in (None, float("nan"), float("inf"), True, "20"):
+            for value in (float("nan"), float("inf"), True, "20"):
                 report = screening(); report["results"][0]["latest"][field] = value
                 with self.subTest(field=field, kind=type(value).__name__), self.assertRaises(daily_report.ReportError):
                     daily_report.format_daily_report(report)
@@ -129,7 +129,9 @@ class FormatTests(unittest.TestCase):
     def test_finite_warned_indicators_outside_normal_range_are_preserved(self):
         report = screening(); warn(report)
         report["results"][0]["latest"].update(k=-2.5, d=101.2)
-        self.assertIn("-2.5 101.2", daily_report.format_daily_report(report))
+        body = daily_report.format_daily_report(report)
+        self.assertEqual(row_lines(body)[0].split(), ["CLX", "100.00", "-2", "Oversold"])
+        self.assertEqual(report["results"][0]["latest"], dict(close=100, k=-2.5, d=101.2, crossing_available=True, crossed_below_20=False))
 
     def test_unavailable_crossing_is_not_zero(self):
         for value in (None, 0, "false"):
@@ -184,6 +186,105 @@ class FormatTests(unittest.TestCase):
             first = daily_report.format_daily_report(report)
             self.assertEqual(first, daily_report.format_daily_report(report))
         self.assertEqual(report, original)
+
+
+class StateTests(unittest.TestCase):
+    def test_exact_boundaries_and_unrounded_classification(self):
+        for value, expected in ((19, "Oversold"), (19.99999999, "Oversold"),
+                                (20, "Neutral"), (80, "Neutral"), (80.00000001, "Overbought"),
+                                (81, "Overbought"), (None, "Unavailable")):
+            with self.subTest(value=value):
+                self.assertEqual(daily_report.stochastic_state(value), expected)
+
+    def test_rounding_never_determines_state_or_counts(self):
+        report = screening()
+        values = [19.99999999, 20, 80, 80.00000001]
+        for row, value in zip(report["results"], values): row["latest"]["k"] = value
+        body = daily_report.format_daily_report(report)
+        rows = {line.split()[0]:line.split() for line in row_lines(body)}
+        self.assertEqual(rows["CLX"][-2:], ["20", "Oversold"])
+        self.assertEqual(rows["O"][-2:], ["20", "Neutral"])
+        self.assertEqual(rows["CVX"][-2:], ["80", "Neutral"])
+        self.assertEqual(rows["NUE"][-2:], ["80", "Overbought"])
+        self.assertIn("Oversold: 1", body)
+        self.assertIn("Overbought: 1", body)
+
+    def test_d_remains_internal_validated_and_unchanged(self):
+        report = screening(); original = copy.deepcopy(report)
+        for row in report["results"]: row["latest"]["d"] = 123.456789
+        body = daily_report.format_daily_report(report)
+        self.assertEqual(body.splitlines()[1].split(), ["SYM", "CLOSE", "STOCH", "STATE"])
+        self.assertNotIn("123.456789", body)
+        self.assertTrue(all(row["latest"]["d"] == 123.456789 for row in report["results"]))
+        self.assertEqual([r["latest"]["k"] for r in report["results"]], [r["latest"]["k"] for r in original["results"]])
+        report["results"][0]["latest"]["d"] = float("nan")
+        with self.assertRaises(daily_report.ReportError): daily_report.format_daily_report(report)
+
+    def test_unavailable_rows_visible_after_valid_and_tied_by_symbol(self):
+        report = screening()
+        for i in (0, 1):
+            row = report["results"][i]
+            row["latest"].update(k=None, d=None, crossing_available=False, crossed_below_20=None)
+            row["status"] = "degraded"
+        report["summary"].update(usable_latest_symbols=17, status="incomplete")
+        body = daily_report.format_daily_report(report, demonstration=True)
+        rows = row_lines(body)
+        self.assertEqual(len(rows), 19)
+        self.assertEqual([line.split()[0] for line in rows[-2:]], ["CLX", "O"])
+        self.assertTrue(all(line.split()[-2:]==["--", "Unavailable"] for line in rows[-2:]))
+        self.assertIn("17/19 evaluated", body)
+        self.assertNotIn("19/19", body)
+        self.assertIn("INCOMPLETE: 2 unavailable/failed", body)
+        self.assertIn("Crossings: incomplete (0 known)", body)
+        self.assertIn("Oversold: 0 | Overbought: 0", body)
+        self.assertIn("State counts use available scores only", body)
+        self.assertLessEqual(len(body), 1024)
+
+    def test_failed_acquisition_is_visible_without_fake_close_or_neutral_state(self):
+        report = screening()
+        report["results"][0] = dict(symbol="CLX", status="failed", error="Data acquisition failed")
+        report["summary"].update(acquired_symbols=18, evaluated_symbols=18, usable_latest_symbols=18, status="incomplete")
+        body = daily_report.format_daily_report(report)
+        self.assertEqual(row_lines(body)[-1].split(), ["CLX", "--", "--", "Unavailable"])
+        self.assertIn("18/19 evaluated", body)
+        self.assertIn("Crossings: incomplete", body)
+
+    def test_null_close_and_missing_indicator_field_remain_failures(self):
+        report = screening(); report["results"][0]["latest"]["close"] = None
+        with self.assertRaises(daily_report.ReportError): daily_report.format_daily_report(report)
+        report = screening(); del report["results"][0]["latest"]["d"]
+        with self.assertRaises(daily_report.ReportError): daily_report.format_daily_report(report)
+
+    def test_degraded_d_or_crossing_diagnostic_not_counted_as_successful_evaluation(self):
+        for changes in (dict(d=None), dict(crossing_available=False, crossed_below_20=None)):
+            report = screening()
+            report["results"][0]["latest"].update(changes)
+            report["results"][0]["status"] = "degraded"
+            report["summary"].update(usable_latest_symbols=18, status="incomplete")
+            body = daily_report.format_daily_report(report)
+            self.assertIn("18/19 evaluated", body)
+            self.assertEqual(row_lines(body)[0].split(), ["CLX", "100.00", "30", "Neutral"])
+            self.assertIn("Diagnostics unavailable: CLX", body)
+            self.assertIn("Oversold: 0 | Overbought: 0", body)
+
+    def test_all_unavailable_still_fits_as_incomplete_not_zero_signal_day(self):
+        report = screening()
+        report["results"] = [dict(symbol=s, status="failed") for s in SYMBOLS]
+        report["summary"].update(acquired_symbols=0, evaluated_symbols=0, usable_latest_symbols=0, status="incomplete")
+        body = daily_report.format_daily_report(report, demonstration=True)
+        self.assertIn("0/19 evaluated", body)
+        self.assertEqual(len(row_lines(body)), 19)
+        self.assertEqual(body.count("Unavailable"), 19)
+        self.assertIn("Crossings: incomplete", body)
+        self.assertLessEqual(len(body), 1024)
+
+    def test_whole_number_display_uses_python_nearest_even_rounding(self):
+        report = screening()
+        report["results"][0]["latest"]["k"] = 42.5
+        report["results"][1]["latest"]["k"] = 43.5
+        rows = {line.split()[0]:line.split() for line in row_lines(daily_report.format_daily_report(report))}
+        self.assertEqual(rows["CLX"][2], "42")
+        self.assertEqual(rows["O"][2], "44")
 
 
 class TransportTests(unittest.TestCase):

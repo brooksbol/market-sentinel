@@ -1,7 +1,7 @@
-"""Pure full-universe formatting and explicit one-message transport integration.
+"""Pure operator-friendly full-universe report and explicit one-message delivery.
 
-Accept existing evaluated screening dictionaries; never acquire prices, calculate
-indicators, repair input, deduplicate events or schedule notifications here.
+Acquisition, TA-Lib calculations and crossing rules are unchanged. This module
+only validates evaluated results, classifies usable K and formats a snapshot.
 """
 
 from datetime import date
@@ -45,49 +45,70 @@ def _count(value, expected):
     return type(value) is int and value == expected
 
 
-def format_daily_report(screening, *, demonstration=False):
-    """Return one complete, preflighted body; all 19 rows or ReportError.
+def stochastic_state(k):
+    """Classify unrounded finite K; None is Unavailable, never Neutral.
 
-    Full-precision K controls sort and below-20 count; symbol breaks ties. Display
-    formatting never participates in signal detection. Input crossing flags come
-    from the screening layer. Range warnings are allowed, with separate sample
-    and report-session counts. Incomplete/undefined/mixed-session data fail closed.
-    There is no I/O, credential retrieval or input mutation.
+    Exact 20 and 80 are Neutral. These are technical screening states, not
+    valuations, forecasts or investment recommendations.
+    """
+    if k is None:
+        return "Unavailable"
+    k = _number(k)
+    return "Oversold" if k < 20 else "Overbought" if k > 80 else "Neutral"
+
+
+def format_daily_report(screening, *, demonstration=False):
+    """Return all 19 rows or ReportError; never mutate or repair source results.
+
+    Rows with available K sort by full-precision K then symbol. Explicit upstream
+    failures or unavailable K remain visible at the end, sorted by symbol. Any
+    unavailable diagnostics make the report incomplete and aggregate crossings
+    unknown. A known K still determines its state even if D is unavailable. D is
+    validated internally but omitted from the default notification. No I/O.
     """
     _require(isinstance(screening, dict), "A screening report is required.")
     summary, results = screening.get("summary"), screening.get("results")
     _require(isinstance(summary, dict) and isinstance(results, (list, tuple)), "Missing screening summary or rows.")
     _require(len(results) == len(SYMBOLS), "Incomplete universe: all 19 symbol rows are required.")
     session = _date(summary.get("completed_session"))
-    for key in ("configured_symbols", "acquired_symbols", "evaluated_symbols", "usable_latest_symbols"):
-        _require(_count(summary.get(key), len(SYMBOLS)), "Incomplete evaluation: 19/19 usable symbols required.")
-    _require(summary.get("status") in ("complete", "complete_with_warnings"), "Screening evaluation is incomplete.")
+    _require(_count(summary.get("configured_symbols"), len(SYMBOLS)), "The configured universe must contain 19 symbols.")
     seen = set()
-    rows, warning_count, session_warnings, crossings = [], 0, 0, 0
+    rows, warning_count, session_warnings, crossings, evaluated = [], 0, 0, 0, 0
     for result in results:
         _require(isinstance(result, dict), "Invalid screening row.")
         symbol = result.get("symbol")
         _require(isinstance(symbol, str) and symbol in SYMBOLS and symbol not in seen,
                  "Universe contains an unknown or duplicate symbol.")
         seen.add(symbol)
-        _require(result.get("status") in ("calculated", "calculated_with_warnings"), "A symbol failed or has unavailable indicators.")
-        _require(result.get("stale_relative_to_cutoff") is False, "Stale symbol cannot enter a complete report.")
+        status = result.get("status")
+        failed = status in ("failed", "not attempted after access/quota failure")
+        if failed:
+            _require("latest" not in result, "Failed rows must not substitute prior observations.")
+            rows.append((symbol, None, None, False))
+            continue
+        _require(status in ("calculated", "calculated_with_warnings", "degraded"), "Invalid symbol evaluation status.")
+        _require(result.get("stale_relative_to_cutoff") is False, "Stale symbol cannot substitute an earlier session.")
         _require(_date(result.get("last_session")) == session and
                  _date(result.get("completed_through")) == session, "Mixed completed-session dates are not permitted.")
         latest = result.get("latest")
         _require(isinstance(latest, dict), "Missing latest indicator observation.")
-        close, k, d = (_number(latest.get(key)) for key in ("close", "k", "d"))
+        close = _number(latest.get("close"))
         _require(close > 0, "Closing price must be positive.")
-        _require(latest.get("crossing_available") is True and type(latest.get("crossed_below_20")) is bool,
-                 "Latest crossing evaluation is unavailable.")
-        crossed = latest["crossed_below_20"]
+        _require("k" in latest and "d" in latest, "Missing indicator fields; unavailable values must be explicit nulls.")
+        k, d = (None if latest[key] is None else _number(latest[key]) for key in ("k", "d"))
+        crossing_available, crossed = latest.get("crossing_available"), latest.get("crossed_below_20")
+        _require(type(crossing_available) is bool, "Crossing availability must be explicit.")
+        _require((crossing_available and type(crossed) is bool and k is not None) or
+                 (not crossing_available and crossed is None), "Inconsistent or missing crossing evaluation.")
         _require(not crossed or k < 20, "Crossing flag contradicts the current K value.")
-        crossings += crossed
+        crossings += crossed is True
+        evaluated += 1
+        usable = k is not None and d is not None and crossing_available
         warnings = result.get("warnings")
         _require(isinstance(warnings, list) and _count(result.get("warning_count"), len(warnings)),
                  "Missing or inconsistent data-quality warning details.")
-        _require(result["status"] == ("calculated_with_warnings" if warnings else "calculated"),
-                 "Symbol warning status is inconsistent.")
+        _require(status == ("degraded" if not usable else "calculated_with_warnings" if warnings else "calculated"),
+                 "Symbol availability/warning status is inconsistent.")
         for warning in warnings:
             _require(isinstance(warning, dict), "Malformed data-quality warning.")
             warning_session = _date(warning.get("session"))
@@ -95,21 +116,43 @@ def format_daily_report(screening, *, demonstration=False):
             _require(type(excluded) is bool and excluded == (warning_session > session), "Inconsistent warning session scope.")
             session_warnings += warning_session == session and not excluded
         warning_count += len(warnings)
-        rows.append((symbol, close, k, d))
+        # State always follows K alone. Missing D/adjacent comparison reduces the
+        # successful evaluation count, but cannot turn a known K into Neutral or
+        # hide its screening state. The source diagnostics remain untouched.
+        rows.append((symbol, close, k, usable))
+    usable_count = sum(row[3] for row in rows)
     _require(seen == set(SYMBOLS), "Incomplete configured universe.")
+    _require(_count(summary.get("evaluated_symbols"), evaluated) and
+             _count(summary.get("usable_latest_symbols"), usable_count), "Evaluation summary disagrees with symbol results.")
+    acquired = summary.get("acquired_symbols")
+    _require(type(acquired) is int and evaluated <= acquired <= len(SYMBOLS), "Invalid acquisition count.")
     _require(_count(summary.get("new_downward_crossings"), crossings), "Crossing summary disagrees with symbol results.")
     _require(_count(summary.get("warning_count"), warning_count), "Warning summary disagrees with symbol results.")
-    _require(summary["status"] == ("complete_with_warnings" if warning_count else "complete"), "Summary warning status is inconsistent.")
-    rows.sort(key=lambda row: (row[2], row[0]))
-    displayed = [(symbol, f"{close:.2f}", f"{k:.1f}", f"{d:.1f}") for symbol, close, k, d in rows]
-    headers = ("SYM", "CLOSE", "K", "D")
+    incomplete = usable_count != len(SYMBOLS)
+    _require(summary.get("status") == ("incomplete" if incomplete else "complete_with_warnings" if warning_count else "complete"),
+             "Summary completion/warning status is inconsistent.")
+    rows.sort(key=lambda row: (row[2] is None, row[2] if row[2] is not None else 0, row[0]))
+    displayed = [(symbol, f"{close:.2f}" if close is not None else "--",
+                  f"{k:.0f}" if k is not None else "--", stochastic_state(k))
+                 for symbol, close, k, _ in rows]
+    headers = ("SYM", "CLOSE", "STOCH", "STATE")
     widths = [max(len(headers[i]), *(len(row[i]) for row in displayed)) for i in range(4)]
     def line(row):
-        return f"{row[0]:<{widths[0]}} " + " ".join(f"{row[i]:>{widths[i]}}" for i in range(1, 4))
-    lines = [f"{session} | 19/19 | Stoch 14,3,3", line(headers)]
+        return f"{row[0]:<{widths[0]}} {row[1]:>{widths[1]}} {row[2]:>{widths[2]}} {row[3]:<{widths[3]}}".rstrip()
+    lines = [f"{session} | {usable_count}/19 evaluated", line(headers)]
+    if incomplete:
+        lines.insert(1, f"INCOMPLETE: {len(SYMBOLS)-usable_count} unavailable/failed")
     lines.extend(line(row) for row in displayed)
-    lines.extend((f"Crossings: {crossings} | Below 20: {sum(row[2] < 20 for row in rows)}",
+    oversold = sum(row[2] is not None and row[2] < 20 for row in rows)
+    overbought = sum(row[2] is not None and row[2] > 80 for row in rows)
+    lines.extend((f"Crossings: incomplete ({crossings} known)" if incomplete else f"Crossings: {crossings} | Oversold: {oversold}",
+                  f"Oversold: {oversold} | Overbought: {overbought}" if incomplete else f"Overbought: {overbought}",
                   f"Warnings: {warning_count} sample; {session_warnings} on session"))
+    if incomplete:
+        diagnostics = [row[0] for row in rows if row[2] is not None and not row[3]]
+        if diagnostics:
+            lines.append("Diagnostics unavailable: " + ",".join(diagnostics))
+        lines.append("State counts use available scores only.")
     if demonstration:
         lines.insert(0, "DEMONSTRATION - previously verified data")
         lines.append("Not a live scheduled result. Manual review.")
@@ -119,7 +162,7 @@ def format_daily_report(screening, *, demonstration=False):
     try:
         validate_message(TITLE + (" TEST" if demonstration else ""), body)
     except PushError:
-        raise ReportError("Complete report exceeds Pushover limits or contains invalid text; nothing sent.") from None
+        raise ReportError("Complete universe report exceeds Pushover limits or contains invalid text; nothing sent.") from None
     return body
 
 
@@ -127,7 +170,6 @@ def send_daily_report(token, user_key, screening, *, demonstration=False):
     """One explicitly authorized send after full preflight. No retries or fallback.
 
     Return only on API acceptance; phone receipt requires operator confirmation.
-    Credential access belongs to the caller, not the formatter.
     """
     body = format_daily_report(screening, demonstration=demonstration)
     try:

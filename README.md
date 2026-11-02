@@ -176,8 +176,9 @@ There are two separate notification products:
   downward crossings; automatic delivery and durable event identity remain planned.
 - **Daily universe report:** replaces the proposed generic keep-alive. Always
   includes all 19 fixed symbols, sorted by unrounded smoothed K ascending, with
-  symbol as tie-breaker. Columns show close (two decimals), K and D (one decimal).
-  Crossings and currently-below-20 counts are distinct and use unrounded results.
+  symbol as tie-breaker. Columns show close (two decimals), whole-number Stochastic
+  score and plain-language state. Crossings and currently oversold/overbought
+  counts are distinct and use unrounded smoothed K. D remains in diagnostics only.
 
 `market_sentinel.daily_report.format_daily_report(screening, demonstration=False)`
 is pure: it accepts the evaluated dictionary produced by `tradier_report`, validates
@@ -185,23 +186,49 @@ its summary and per-symbol results, and returns one complete body. It performs n
 price acquisition, indicator calculation, credential access, I/O or mutation.
 `send_daily_report(token, user_key, screening, demonstration=False)` preflights
 that body and calls Pushover exactly once with `monospace=1`; it never retries,
-truncates, splits, sends attachments or substitutes a partial report.
+truncates, splits, sends attachments or omits configured rows.
 
-All 19 symbols must appear exactly once with usable same-session close/K/D and an
-available adjacent-K crossing evaluation. Failed, missing, stale, undefined or
-mixed-session results and inconsistent counts raise `ReportError` before HTTP.
-Accepted range warnings remain visible as `Warnings: N sample; M on session`,
-separating historical-sample occurrences from those dated to the report session.
-A complete report describes supplied screening results; it does not certify
-independent exchange-calendar continuity or market-price truth.
+The score displays rounded Stochastic(14,3,3) smoothed K as a whole number,
+using Python's nearest-even rounding for exact halfway values. Internal K/D and
+crossing inputs remain unrounded. `stochastic_state(k)` is a pure classification:
+
+| Unrounded K | State |
+|---|---|
+| Below 20 | Oversold |
+| 20 through 80, inclusive | Neutral |
+| Above 80 | Overbought |
+| Unavailable (`None`) | Unavailable |
+
+These are technical screening states, not valuations or recommendations. A score
+that displays 20 may still be Oversold, or a displayed 80 Overbought, because
+classification and ordering use full precision. No D column is sent. D is still
+calculated, validated and retained unchanged in the screening JSON.
+
+All 19 symbol identities are required exactly once. Rows with known K sort by
+unrounded K/symbol; failed or unavailable-K rows sort last by symbol. Explicit
+upstream failures show `--` for unknown close/score and Unavailable for state.
+Unavailable K contributes to neither oversold nor overbought counts. A real same-session close can still be shown. If only diagnostic D or
+the adjacent comparison is unavailable, the known K still determines score, state
+and ordering; a separate line identifies the missing diagnostics and evaluation
+is incomplete. Existing source diagnostics remain untouched. The header
+counts successfully usable evaluations (for example 18/19), not merely attempted
+calculations. Incomplete reports explicitly label the number unavailable/failed
+and show `Crossings: incomplete (N known)`, never a successful zero-signal claim.
+
+Malformed/nonfinite prices or indicators, missing required fields (distinct from
+explicit indicator nulls), duplicate/missing symbols, stale or mixed-session
+substitutions and inconsistent summary counts raise `ReportError` before HTTP.
+No price is repaired or silently substituted. Accepted range warnings remain
+visible as `Warnings: N sample; M on session`, separating historical-sample
+occurrences from those dated to the report session. This does not independently
+certify calendar continuity or market-price truth.
 
 The title is **Market Sentinel — Daily Report**, with **TEST** appended for a
-demonstration. Demo bodies explicitly identify previously verified data and say
-that they are not a live scheduled result. The October 30, 2026 retained dataset
-formats to **619 characters / 619 UTF-8 bytes**, including all 19 rows, two current
-oversold observations, zero new crossings and 13 sample warnings (zero on session).
-There is room to add an RSI column in a separately authorized slice; no RSI values
-or placeholder calculations are implemented now.
+demonstration. Demo bodies identify previously verified data and say they are not
+a live scheduled result. The October 30, 2026 retained dataset formats to
+**735 characters / 735 UTF-8 bytes**, including all 19 rows, two Oversold, nine
+Overbought, zero new crossings and 13 sample warnings (zero on session). RSI
+remains a separately authorized future slice; no RSI values or placeholders exist.
 
 Pushover permits **1,024 UTF-8 characters**, not 1,024 bytes or percent-encoded
 HTTP bytes. The shared transport validates UTF-8 encodability, body code-point
@@ -244,12 +271,19 @@ as a demonstration fixture, not the daily report product. Earlier RETEST receipt
 locked-screen display and audible delivery were independently operator-confirmed.
 Each new live demonstration requires its own authorization and receipt confirmation.
 
-On November 2, 2026, the consolidated October 30 daily-report demonstration was
-accepted by Pushover (HTTP 200 / status 1) in **one request**, with `monospace=1`,
-no retries and no priority/sound overrides. Its complete body was 619 characters
-and 619 UTF-8 bytes. Receipt of this particular report remains pending operator
-confirmation. **150 offline tests passed**; previous demonstration files were
-preserved in a separate commit before the formatter work.
+The original K/D-column report was accepted in one Pushover request on November
+2, 2026 and independently confirmed by the operator and latest iPhone screenshot.
+The revised 735-character operator-friendly demonstration was accepted by Pushover
+in one HTTPS request (HTTP 200/status 1), with monospace and unchanged priority/
+sound settings. No retry occurred. The operator confirmed receipt and accepted
+the revised display; the November 2 iPhone screenshot independently shows all 19
+rows and the new score/state columns.
+
+**159 offline tests passed** for the presentation slice. Classification boundaries,
+full-precision sorting, unavailable/failure visibility, warning scope, whole-number
+display, message-size preflight, no D display, and existing calculation/transport
+regressions are covered. TA-Lib, Tradier acquisition, crossing rules, fixed
+`push-test` and the historical `demo_push` implementation are unchanged.
 
 ## Stochastic(14,3,3) — TA-Lib migration complete
 
