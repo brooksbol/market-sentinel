@@ -28,6 +28,119 @@ There are no third-party runtime or test dependencies. Packaging uses setuptools
 tests use Python's standard-library `unittest`. Routine verification must never
 contact Pushover or the operator's Keychain.
 
+```sh
+.venv/bin/python -m unittest discover -s tests -v
+.venv/bin/market-sentinel --help
+.venv/bin/market-sentinel push-test
+```
+
+The last command is safe: without `--send`, it sends nothing, reads no credentials
+and exits **2**. The installed entry point also works as
+`.venv/bin/python -m market_sentinel`.
+
+## Pushover transport proof — implemented
+
+This slice sends only this fixed test message:
+
+> **Market Sentinel — Test**
+>
+> Push transport verification. No market signal or trading action.
+
+It posts once to the fixed HTTPS Pushover endpoint with a 10-second network
+timeout, normal certificate validation, no redirects and no ambient HTTP proxies.
+It checks both HTTP 200 and integer JSON `status: 1`. It never prints credentials,
+raw response bodies or raw transport errors. There are no automatic retries:
+a timeout can occur after the provider accepted the notification.
+
+Exit **0** means API acceptance only; exit **1** means request failure or unknown
+acceptance; exit **2** means command misuse or the missing `--send` flag.
+Neither a successful exit nor a provider response confirms phone delivery.
+
+### Operator setup — do this yourself; do not share secrets
+
+1. Install the [Pushover iPhone app](https://pushover.net/clients), create/sign into
+   your own Pushover account, and enable iPhone notifications. The trial can be
+   used before deciding whether to purchase the individual iOS license. This code
+   creates no account and purchases nothing.
+2. On your [Pushover dashboard](https://pushover.net/), find your **User Key**.
+3. Use [Create an Application/API Token](https://pushover.net/apps/build) to register
+   your own application named **Market Sentinel**. Choose the appropriate script/
+   application type; obtain its **API Token/Key**. No market-data or brokerage
+   account is involved. Never reuse example tokens from documentation.
+4. Prefer **Keychain Access** on the Mac. In your login keychain, create two
+   password items (File → New Password Item):
+
+   | Keychain Item Name (service) | Account | Password |
+   |---|---|---|
+   | `market-sentinel.pushover` | `application-token` | Your application token |
+   | `market-sentinel.pushover` | `user-key` | Your User Key |
+
+   Enter values directly into Keychain Access, never into repository files or
+   shell commands. The client reads them through `/usr/bin/security` only when
+   `push-test --send` is explicitly invoked. macOS may ask you to allow Keychain
+   access; a locked/missing item fails safely. Retrieval is limited to 15 seconds
+   per item, so complete any access prompt promptly or run again after resolving
+   it. Environment overrides take precedence and must supply both values.
+5. **Stop until the operator explicitly authorizes one live transport test.**
+   Provider setup alone is not permission for a coding actor to send a message.
+
+After that authorization, the operator can run exactly once:
+
+```sh
+.venv/bin/market-sentinel push-test --send
+```
+
+Independently verify that the exact test appears on the locked iPhone, with the
+app not foregrounded, and confirm receipt to the engineer. Check iOS notification
+permissions and Focus settings if the API accepts but no notification appears.
+Do not describe this as a market signal or an operational daily monitor.
+
+### Initial environment handoff alternative (interactive zsh)
+
+If Keychain has not been configured, hidden terminal input is acceptable. Never
+type the actual values as command arguments or save them in an `.env` file inside
+the checkout. The following subshell keeps values out of shell history, disables
+tracing and drops its environment on exit. **It sends a real request: use only
+after explicit authorization.**
+
+```sh
+(
+  set +x
+  read -rs 'PUSHOVER_APP_TOKEN?Pushover application token (hidden): '
+  printf '\n'
+  read -rs 'PUSHOVER_USER_KEY?Pushover user key (hidden): '
+  printf '\n'
+  export PUSHOVER_APP_TOKEN PUSHOVER_USER_KEY
+  .venv/bin/market-sentinel push-test --send
+)
+```
+
+Environment values are temporarily available to the child process and potentially
+privileged local inspection. Use Keychain for ongoing operation. No command accepts
+credentials as arguments, and argument errors do not echo supplied arguments.
+
+### Failure handling and maintenance
+
+- Rejected credentials/request: check the dashboard, token, User Key and active
+  device. Fix setup before another authorized attempt; repeated requests do not
+  repair authentication.
+- Quota: wait for reset or investigate usage; do not loop. Network/TLS/server
+  failure or timeout: acceptance may be unknown. Check the phone before authorizing
+  another test; duplicate delivery remains possible after an ambiguous failure.
+- Revoke/replace compromised credentials through the provider, update Keychain,
+  unset stale environment overrides and authorize a fresh test. Never put old or
+  new values in a report. Error output intentionally omits raw provider diagnostics.
+- API acceptance, OS notification display and operator-confirmed receipt are
+  separate observations. There is no receipt tracking or durable retry queue in
+  this transport-only proof.
+
+Tests mock HTTP and Keychain using synthetic credentials, including successful
+request construction, rejected credentials, malformed/provider errors, timeout,
+safe diagnostics, explicit send intent and CLI exit status. No live push is needed
+for code-level completion. Future acceptance adds offline indicator fixtures,
+TradingView comparison, synthetic crossings, independent identities, deduplication,
+re-arming, missed-session recovery, all-symbol data validation, then scheduling.
+
 ## Intended monitor — requirements, not implemented
 
 Keep scheduling, data acquisition, pure indicator calculations, crossing
