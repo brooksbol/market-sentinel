@@ -17,6 +17,7 @@ symbols. Range inconsistencies produce structured warnings without price repair.
 A pure full-universe formatter and explicitly authorized one-message Pushover
 report are also implemented. Local twice-daily launchd delivery is now commissioned
 and implemented, with a protected report-delivery ledger and wake/startup catch-up.
+An on-demand local browser now reads those retained reports and delivery state.
 RSI, SQLite monitoring/event persistence and automatic actionable alerts remain
 unimplemented. This is
 independent of Wheelwright's runtime, credentials and Product boundaries.
@@ -716,6 +717,84 @@ new crossings and 13 sample warnings (zero on session), fit in 712 ASCII
 characters/UTF-8 bytes, and was accepted by Pushover. This verifies launchd-to-API
 operation; phone receipt for this newly automatic report still requires independent
 operator confirmation. Future closing-bar publication time remains unverified.
+
+## Local report history — read-only browser
+
+From this checkout, use a maintained Python (3.12 or later); no installation is
+needed for the viewer itself:
+
+```sh
+PYTHONPATH=src python3.14 -m market_sentinel.report_history
+```
+
+Open **http://127.0.0.1:8765/** on the Mac. The list shows newest scheduled slots
+first, with opening and closing kept separate even when their completed data
+session matches. Open a row for all retained symbol results, full-precision K/D,
+crossings, individual warnings and source details. Refresh to reread the files;
+Ctrl-C stops the viewer. `--port 8766` selects another local port. An existing
+alternate report directory may be selected with `--reports-dir /path/to/reports`.
+The viewer uses the standard library and does not require TA-Lib to read reports.
+
+The existing `automatic-reports` JSON files and `state.json` are the only data
+sources. No directory, database, browser storage, report cache or retention policy
+is created. Opening a page never acquires data, reads provider credentials,
+sends a message, modifies a ledger, retries a delivery or starts another service.
+No Wheelwright dependency or integration is introduced.
+
+The report is the artifact, independent of Pushover's compact notification.
+The page renders retained substantive data, not a reconstructed push message.
+Evidence timestamps are source report metadata; an exact notification-generation
+time is not independently recorded. The attempt marker is the worker's recorded
+invocation clock, not an exact HTTP-start time. `accepted` means Pushover API
+acceptance; `unknown` includes rejection or uncertain acceptance. Device receipt
+is **not recorded**. A retained report can precede its ledger entry. Missing,
+malformed, oversized (above 16 MiB per JSON file), or disagreeing records remain
+visible as unavailable/inconsistent; the viewer never repairs them. Report and
+ledger reads are separate snapshots and are not an atomic pair. The history covers
+retained scheduled reports, not every failed acquisition or a separate delivered
+crossing-alert archive. Historical crossings shown in source details are retained
+sample observations, not proof that an alert was sent.
+
+Access binds only to `127.0.0.1`. Host/origin checks, escaped text, no-store
+responses and explicit GET routes restrict local serving; there is no general
+directory browser, write operation, third-party asset or request log. This is for
+a trusted single-user Mac: loopback is not per-user authentication. Do not expose
+it through a proxy/tunnel or change it into a LAN/cloud service. The existing
+scheduler and phone delivery work independently of the viewer being open.
+
+### Reuse assessment — November 4, 2026
+
+[Pushover's browser client](https://pushover.net/clients/desktop) can display
+messages delivered to that browser. Its [Open Client API](https://pushover.net/api/client)
+is also available to third-party device clients, but retrieves **pending messages
+for a registered device**, not a durable archive of previously delivered messages.
+It requires account login/session secrets, device registration and desktop
+licensing, and expects clients to store messages and update receipt progress.
+[Delivered messages are removed from Pushover's servers](https://pushover.net/privacy).
+The existing application token/user-key transport is not an archive-reading API.
+
+The sent message already contains the compact 19-symbol table, without truncation,
+but omits D, precise K, per-symbol crossing flags and full warning records. A
+Pushover-backed history would add credentials, synchronization and local message
+storage while still lacking those retained report details. This slice therefore
+uses **existing Market Sentinel artifacts** for content and the existing ledger
+for known delivery outcomes. Pushover continues to own phone notification delivery;
+no client synchronization, routing, acknowledgments or device management is added.
+
+`report_history.read_history`, `report` and `ledger` read data without HTML,
+provider access or application startup. HTML rendering and the local HTTP handler
+are separate consumers. These are small internal Python functions, not a newly
+published API. A future Wheelwright v2 web consumer could use an explicitly
+designed read interface around this capability without Market Sentinel importing
+or starting Wheelwright, and without either application requiring the other to
+start. No remote endpoint, cross-application contract or v2 integration is part
+of this slice.
+
+Verification: 200 offline tests passed on Python 3.14.10, including 19 viewer
+tests and all existing acquisition, scheduler and Pushover tests. Synthetic
+Safari list/detail navigation, all 19 symbol rows, warning expansion and the
+separate acceptance record were exercised. No live acquisition, credentials,
+notification, scheduler change or production-history mutation was used.
 
 ## Security and operational boundaries
 
