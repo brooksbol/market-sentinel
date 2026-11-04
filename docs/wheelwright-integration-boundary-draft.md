@@ -6,7 +6,7 @@
 
 ## Principle
 
-> Wheelwright governs the financial truth of capabilities it explicitly owns. Market Sentinel governs application-specific analytics, attention, and delivery. Integration occurs through published contracts, never through competing implementations of the same governed capability.
+> Wheelwright establishes the authoritative meaning and qualified results of capabilities it explicitly owns; external systems remain the origin of their own state. Market Sentinel governs application-specific analytics, attention, and delivery. Integration occurs through published contracts, never through competing implementations of the same governed capability.
 
 Ownership is explicit, not inferred merely because a capability involves financial information.
 
@@ -23,7 +23,7 @@ Ownership is explicit, not inferred merely because a capability involves financi
 - Attention scoring and operator-specific prioritization
 - Report composition, scheduling, notifications, duplicate suppression, and delivery history
 
-Market Sentinel may prioritize an oversold instrument for attention without asserting that it is financially eligible, that its options economics are qualified, or that a trade is authorized. **Attention decisions are not trading or execution decisions.**
+Market Sentinel may prioritize an oversold instrument for attention without asserting that it is financially eligible, that its options economics are qualified, or that a trade is authorized. Attention ordering does not redefine Wheelwright financial eligibility or governed comparative ranking; new scoring is separately commissioned. **Attention decisions are not trading or execution decisions.**
 
 ## Cross-repository contract
 
@@ -45,4 +45,4 @@ Market Sentinel flags an oversold Dividend Aristocrat using its Stochastic signa
 
 ## Review and status
 
-This is a **draft for Codex review**, not a ratification or a mandate to migrate the existing Tradier-backed Stochastic pipeline. Review current authority independently in both repositories and identify only material contradictions or minimal changes needed to formalize the boundary. Consider the TT1 exporter as a concrete example of the separate internal-tool-to-published-capability question. Do not expand the scope into an ADR registry, governance process, framework, or implementation plan.
+This is a **draft working principle**, not ratified authority or a mandate to migrate the existing Tradier-backed Stochastic pipeline. It proposes a **mandatory** architectural boundary for any future Wheelwright-governed integration: published Wheelwright interfaces are the only permitted integration path. It establishes no immediate integration requirement and does not change Market Sentinel's current independent operating scope. Review current authority independently in both repositories and identify only material contradictions or minimal changes needed to formalize the boundary. Consider the TT1 exporter as a concrete example of the separate internal-tool-to-published-capability question. Do not expand the scope into an ADR registry, governance process, framework, or implementation plan.
