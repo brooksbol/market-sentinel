@@ -720,20 +720,36 @@ operator confirmation. Future closing-bar publication time remains unverified.
 
 ## Local report history — read-only browser
 
-From this checkout, use a maintained Python (3.12 or later); no installation is
-needed for the viewer itself:
+Install the `sentinel` console command using the Mac's existing Market Sentinel
+Python environment. From this checkout, run this one installation command:
 
 ```sh
-PYTHONPATH=src python3.14 -m market_sentinel.report_history
+~/kiro/market-sentinel/.venv/bin/python -m pip install --no-deps . && ln -sfn ~/kiro/market-sentinel/.venv/bin/sentinel ~/.local/bin/sentinel
 ```
 
-Open **http://127.0.0.1:8765/** on the Mac. The list shows newest scheduled slots
+`~/.local/bin` is already on this Mac's PATH. The installed command uses the
+existing virtual environment; it does not need the checkout, its working directory
+or `PYTHONPATH` at runtime. No new runtime dependency is added. After source
+updates, repeat the installation command. No scheduler installation is involved.
+
+From any directory, run:
+
+```sh
+sentinel
+```
+
+It starts the loopback server and opens **http://127.0.0.1:8765/** in the default
+browser. An occupied port fails clearly without opening a browser. If browser
+opening fails, the server remains available at the printed URL.
+The list shows newest scheduled slots
 first, with opening and closing kept separate even when their completed data
 session matches. Open a row for all retained symbol results, full-precision K/D,
 crossings, individual warnings and source details. Refresh to reread the files;
 Ctrl-C stops the viewer. `--port 8766` selects another local port. An existing
 alternate report directory may be selected with `--reports-dir /path/to/reports`.
 The viewer uses the standard library and does not require TA-Lib to read reports.
+The original `python -m market_sentinel.report_history` entry remains available
+without automatic browser opening.
 
 The existing `automatic-reports` JSON files and `state.json` are the only data
 sources. No directory, database, browser storage, report cache or retention policy
@@ -795,6 +811,14 @@ tests and all existing acquisition, scheduler and Pushover tests. Synthetic
 Safari list/detail navigation, all 19 symbol rows, warning expansion and the
 separate acceptance record were exercised. No live acquisition, credentials,
 notification, scheduler change or production-history mutation was used.
+
+Launcher follow-up: 204 offline tests passed both against source and the installed
+package, including browser-after-bind, occupied-port failure, browser failure and
+Ctrl-C cleanup. Installed `sentinel` was invoked from `/tmp` without `PYTHONPATH`;
+default-browser opening, existing report-directory selection, clean exit and port
+release were verified. Installation reused the existing Python 3.14 environment;
+all ten pre-existing operational modules remain byte-identical. No new daemon,
+LaunchAgent, notification or report/ledger mutation was introduced.
 
 ## Security and operational boundaries
 

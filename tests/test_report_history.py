@@ -3,6 +3,7 @@
 import copy
 import hashlib
 import http.client
+import io
 import json
 import os
 import subprocess
@@ -263,6 +264,56 @@ class HttpTests(unittest.TestCase):
         self.request()
         self.request('/reports/2026-11-02-opening')
         self.assertEqual({p.name: p.read_bytes() for p in self.root.iterdir()}, before)
+
+
+class LauncherTests(unittest.TestCase):
+    def test_console_entry_opens_existing_viewer(self):
+        with patch.object(viewer, 'main', return_value=0) as main:
+            self.assertEqual(viewer.launch(), 0)
+        main.assert_called_once_with(open_browser=True)
+
+    def test_browser_opens_only_after_loopback_bind_and_ctrl_c_closes_socket(self):
+        with tempfile.TemporaryDirectory() as directory:
+            server = viewer.make_server(Path(directory), 0)
+            port = server.server_port
+            opened = threading.Event()
+
+            def browser(url, *, new):
+                self.assertEqual(url, f'http://127.0.0.1:{port}/')
+                self.assertEqual(new, 2)
+                self.assertGreaterEqual(server.fileno(), 0)
+                opened.set()
+                return True
+
+            def interrupted():
+                self.assertTrue(opened.wait(3))
+                raise KeyboardInterrupt
+
+            with patch.object(viewer, 'make_server', return_value=server), \
+                    patch.object(server, 'serve_forever', side_effect=interrupted), \
+                    patch.object(viewer.webbrowser, 'open', side_effect=browser), \
+                    patch('sys.stdout', new_callable=io.StringIO):
+                self.assertEqual(viewer.main([], open_browser=True), 0)
+            self.assertEqual(server.fileno(), -1)
+
+    def test_occupied_port_reports_clear_error_without_opening_browser(self):
+        with tempfile.TemporaryDirectory() as directory, viewer.make_server(Path(directory), 0) as occupied:
+            with patch.object(viewer.webbrowser, 'open') as browser, \
+                    patch('sys.stderr', new_callable=io.StringIO) as error:
+                result = viewer.main(['--port', str(occupied.server_port)], open_browser=True)
+            self.assertEqual(result, 1)
+            self.assertIn(f'Port {occupied.server_port} is already in use', error.getvalue())
+            browser.assert_not_called()
+
+    def test_browser_failure_leaves_manual_url_available(self):
+        for outcome in [False, OSError('private diagnostic'), viewer.webbrowser.Error('private diagnostic')]:
+            with self.subTest(outcome=type(outcome).__name__):
+                kwargs = {'return_value': outcome} if outcome is False else {'side_effect': outcome}
+                with patch.object(viewer.webbrowser, 'open', **kwargs), \
+                        patch('sys.stderr', new_callable=io.StringIO) as error:
+                    viewer.open_report_browser('http://127.0.0.1:8765/')
+                self.assertIn('Open http://127.0.0.1:8765/', error.getvalue())
+                self.assertNotIn('private diagnostic', error.getvalue())
 
 
 if __name__ == '__main__':

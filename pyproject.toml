@@ -12,6 +12,7 @@ dependencies = ["TA-Lib==0.8.3"]
 
 [project.scripts]
 market-sentinel = "market_sentinel.__main__:main"
+sentinel = "market_sentinel.report_history:launch"
 
 [tool.setuptools.packages.find]
 where = ["src"]

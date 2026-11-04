@@ -1,12 +1,15 @@
 """On-demand, loopback-only reader of existing scheduled reports. Standard library only."""
 
 import argparse
+import errno
 import json
 import math
 import os
 import re
 import stat
 import sys
+import threading
+import webbrowser
 from datetime import date
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -289,7 +292,22 @@ def make_server(root=RUNTIME, port=8765):
     return ThreadingHTTPServer(('127.0.0.1', port), Handler)
 
 
-def main(argv=None):
+def open_report_browser(url):
+    """Browser failure must not take down the already listening report reader."""
+    try:
+        if webbrowser.open(url, new=2):
+            return
+    except (OSError, webbrowser.Error):
+        pass
+    print(f'Could not open the browser automatically. Open {url}', file=sys.stderr)
+
+
+def launch():
+    """Installed sentinel entry point; package discovery is handled by Python."""
+    return main(open_browser=True)
+
+
+def main(argv=None, *, open_browser=False):
     parser = argparse.ArgumentParser(description='View existing Market Sentinel reports locally; no acquisition or notifications.')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--reports-dir', type=Path, default=RUNTIME, help='existing report directory (default: automatic-reports)')
@@ -298,12 +316,18 @@ def main(argv=None):
         parser.error('port must be between 1 and 65535')
     try:
         with make_server(args.reports_dir, args.port) as server:
-            print(f'Report history: http://127.0.0.1:{server.server_port}/ (Ctrl-C to stop)', flush=True)
+            url = f'http://127.0.0.1:{server.server_port}/'
+            print(f'Report history: {url} (Ctrl-C to stop)', flush=True)
+            if open_browser:
+                threading.Thread(target=open_report_browser, args=(url,), daemon=True).start()
             server.serve_forever()
     except KeyboardInterrupt:
         return 0
-    except OSError:
-        print('Unable to start the local report viewer. Check the selected port.', file=sys.stderr)
+    except OSError as error:
+        if error.errno == errno.EADDRINUSE:
+            print(f'Port {args.port} is already in use. Stop the other server or use sentinel --port PORT.', file=sys.stderr)
+        else:
+            print('Unable to start the local report viewer. Check the selected port.', file=sys.stderr)
         return 1
     return 0
 
