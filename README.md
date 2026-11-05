@@ -6,6 +6,14 @@ never authorize or execute a trade.
 
 ## Current scope
 
+November 5 realtime engineering candidate: provisional daily Stochastic, bounded
+regular-session polling, durable crossing/notification evidence and
+`sentinel --realtime [SYMBOL]` investigation are described in
+[the realtime contract and verification notes](docs/realtime.md). This is separate
+from the installed daily-report worker. No realtime installation, activation,
+actual notification or cloud deployment has occurred. Sparse provider minute
+series explicitly degrade coverage and suppress signals.
+
 Market Sentinel is an **attention mechanism**: informational screening signals
 prompt independent manual review, never execution or authoritative investment
 recommendations. The Principal selected **Tradier** and accepts occasional extra
@@ -827,8 +835,9 @@ LaunchAgent, notification or report/ledger mutation was introduced.
   not a substitute for checking staged contents.
 - Prefer macOS Keychain for credentials. Never paste secrets into chat, issues,
   pull requests, source, command history, logs or fixtures.
-- No trading, brokerage integration, equity selection, portfolio optimization,
-  dashboard, cloud deployment or GitHub Actions scheduling is commissioned.
+- No trading, brokerage-account integration, equity selection, portfolio
+  optimization, cloud deployment or GitHub Actions scheduling is commissioned.
+  The November 5 realtime dashboard is a bounded engineering candidate only.
 - Do not create accounts, purchase services, send a live notification or install
   a scheduler without the corresponding operator authorization.
 - Preserve the distinction between provider API acceptance and independent phone

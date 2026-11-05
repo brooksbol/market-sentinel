@@ -252,7 +252,7 @@ def detail_page(root, identity):
     return page(identity[:10] + ' ' + identity[11:].capitalize(), content)
 
 
-def make_server(root=RUNTIME, port=8765):
+def make_server(root=RUNTIME, port=8765, *, live_state=None):
     """Only a fixed IPv4 loopback binding; no filesystem-serving superclass."""
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
@@ -264,6 +264,10 @@ def make_server(root=RUNTIME, port=8765):
                 return
             if self.path == '/':
                 self.respond(200, list_page(Path(root)))
+            elif live_state is not None and (self.path == '/realtime' or
+                    self.path.startswith('/realtime/') and self.path[10:] in SYMBOLS):
+                from market_sentinel.realtime_view import live_page
+                self.respond(200, live_page(live_state, self.path[10:] or None))
             elif self.path.startswith('/reports/') and valid_slot(self.path[9:]):
                 self.respond(200, detail_page(Path(root), self.path[9:]))
             else:
@@ -278,6 +282,8 @@ def make_server(root=RUNTIME, port=8765):
             self.send_header('X-Content-Type-Options', 'nosniff')
             self.send_header('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'")
             self.send_header('Referrer-Policy', 'no-referrer')
+            if self.path.startswith('/realtime'):
+                self.send_header('Refresh', '15')
             self.end_headers()
             self.wfile.write(raw)
 
@@ -311,12 +317,19 @@ def main(argv=None, *, open_browser=False):
     parser = argparse.ArgumentParser(description='View existing Market Sentinel reports locally; no acquisition or notifications.')
     parser.add_argument('--port', type=int, default=8765)
     parser.add_argument('--reports-dir', type=Path, default=RUNTIME, help='existing report directory (default: automatic-reports)')
+    parser.add_argument('--realtime', nargs='?', const='ALL', choices=('ALL', *SYMBOLS), help='live investigation; optional symbol')
+    parser.add_argument('--state', type=Path, help='intraday state ledger (read only)')
     args = parser.parse_args(argv)
     if not 1 <= args.port <= 65535:
         parser.error('port must be between 1 and 65535')
     try:
-        with make_server(args.reports_dir, args.port) as server:
-            url = f'http://127.0.0.1:{server.server_port}/'
+        options = {}
+        if args.realtime:
+            from market_sentinel.realtime_view import default_state
+            options['live_state'] = args.state or default_state()
+        with make_server(args.reports_dir, args.port, **options) as server:
+            suffix = ('realtime' + ('/' + args.realtime if args.realtime != 'ALL' else '')) if args.realtime else ''
+            url = f'http://127.0.0.1:{server.server_port}/' + suffix
             print(f'Report history: {url} (Ctrl-C to stop)', flush=True)
             if open_browser:
                 threading.Thread(target=open_report_browser, args=(url,), daemon=True).start()

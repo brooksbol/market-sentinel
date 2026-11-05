@@ -4,7 +4,6 @@ launchd only invokes this worker. Eastern-time session selection, protected
 atomic delivery ledger and acquisition checks live here, apart from pure math.
 """
 
-import calendar
 import fcntl
 import json
 import os
@@ -14,7 +13,6 @@ import sys
 import tempfile
 from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
-from zoneinfo import ZoneInfo
 
 from market_sentinel.daily_report import TITLE, format_daily_report
 from market_sentinel.pushover import _send_message, load_credentials, validate_message
@@ -22,45 +20,11 @@ from market_sentinel.tradier import TradierError, _get_json, fetch_history, load
 from market_sentinel.tradier_report import LABEL, NOTICE, history_report
 from market_sentinel.universe import SYMBOLS
 
-ET = ZoneInfo("America/New_York")
+from market_sentinel.sessions import ET, ScheduleError, normalize_calendar
 LABEL_JOB = "com.market-sentinel.daily-reports"
 RUNTIME = Path.home() / "Library/Application Support/Market Sentinel/automatic-reports"
 RETRY_SECONDS = 900
 
-
-class ScheduleError(ValueError):
-    """Safe operational diagnostic; never contains provider responses or secrets."""
-
-
-def normalize_calendar(payload, year, month):
-    """Require every calendar day, explicit open/closed and valid regular hours."""
-    try:
-        body = payload["calendar"]
-        rows = body["days"]["day"]
-        if body["year"] != year or body["month"] != month or not isinstance(rows, list):
-            raise ValueError
-        result = {}
-        for row in rows:
-            day = date.fromisoformat(row["date"])
-            if str(day) != row["date"] or (day.year, day.month) != (year, month) or str(day) in result:
-                raise ValueError
-            if row["status"] == "closed":
-                result[str(day)] = None
-            elif row["status"] == "open":
-                start, end = row["open"]["start"], row["open"]["end"]
-                opening, closing = time.fromisoformat(start), time.fromisoformat(end)
-                if (day.weekday() >= 5 or opening.tzinfo or closing.tzinfo or
-                        opening >= closing or start != opening.strftime("%H:%M") or end != closing.strftime("%H:%M")):
-                    raise ValueError
-                result[str(day)] = {"start": start, "end": end}
-            else:
-                raise ValueError
-        expected = {str(date(year, month, d)) for d in range(1, calendar.monthrange(year, month)[1] + 1)}
-        if set(result) != expected:
-            raise ValueError
-        return result
-    except (KeyError, TypeError, ValueError, AttributeError):
-        raise ScheduleError("Incomplete or invalid Tradier market calendar; no session assumed.") from None
 
 
 def due_reports(now, activated, sessions):
