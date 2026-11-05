@@ -91,7 +91,7 @@ def validate_message(title: str, message: str) -> None:
         raise PushError("Pushover limit exceeded: title 250 characters, body 1024. Nothing sent.")
 
 
-def _send_message(token: str, user_key: str, title: str, message: str, *, monospace: bool = False) -> None:
+def _send_message(token: str, user_key: str, title: str, message: str, *, monospace: bool = False, before_request=None) -> None:
     """Shared private transport; callers own explicit authorization and payloads."""
     _validate_credentials(token, user_key)
     validate_message(title, message)
@@ -105,6 +105,8 @@ def _send_message(token: str, user_key: str, title: str, message: str, *, monosp
     })
     # Direct HTTPS, normal certificate validation, no ambient proxy or redirects.
     opener = build_opener(ProxyHandler({}), _NoRedirects())
+    if before_request is not None:
+        before_request()  # Intraday deadline/freshness guard, after credential/request preparation.
     try:
         with opener.open(request, timeout=10) as response:
             status = response.status

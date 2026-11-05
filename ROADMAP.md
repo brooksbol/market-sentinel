@@ -2,6 +2,13 @@
 
 _Status: November 2, 2026. Planning document, not authorization to implement subsequent stages._
 
+November 5 update: the Principal separately commissioned bounded realtime
+engineering, including acquisition feasibility, provisional daily Stochastic,
+durable intraday events, Pushover formatting, realtime browser investigation,
+offline verification and independent review. See [realtime.md](docs/realtime.md).
+This supersedes the earlier next-slice suggestion below for this assignment;
+installation, activation, live notifications and cloud deployment remain reserved.
+
 ## Purpose and boundaries
 
 Market Sentinel is a small, independent, deterministic daily technical-indicator monitor for a fixed universe of 19 equities. It is an attention mechanism for informational oversold screening and eventual accountable daily results. The Principal accepts imperfect Tradier history and occasional extra or missed signals; the operator independently reviews all opportunities. The operator makes all investment decisions. It is **not** a trading bot, brokerage integration, stock picker, Wheelwright extension, or general technical-analysis platform.

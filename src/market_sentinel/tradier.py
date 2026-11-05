@@ -170,10 +170,10 @@ def fetch_history(token: str, *, symbol: str, environment: str,
 
 
 def _get_json(token, environment, endpoint, parameters):
-    """Shared bounded GET, restricted to history/calendar market-data endpoints."""
+    """Shared bounded GET, restricted to history/calendar/timesales market data."""
     _environment(environment)
     _token(token)
-    if endpoint not in ("history", "calendar"):
+    if endpoint not in ("history", "calendar", "timesales"):
         raise TradierError("Unsupported market-data endpoint.")
     url = BASES[environment].rsplit("/", 1)[0] + "/" + endpoint
     request = Request(url + "?" + urlencode(parameters), method="GET", headers={
