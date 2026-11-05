@@ -1,5 +1,6 @@
 """Bounded Tradier production polling adapter. No brokerage endpoints."""
 
+import calendar
 import time
 from dataclasses import asdict
 from datetime import date, datetime, timedelta, timezone
@@ -11,15 +12,22 @@ from market_sentinel.stochastic import stochastic_14_3_3
 from market_sentinel.universe import SYMBOLS
 
 
+def budget(deadline):
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ValueError('Acquisition budget exhausted')
+
+
 class Provider:
     def __init__(self, *, clock=lambda: datetime.now(timezone.utc)):
         self.clock = clock
         self.sessions = {}
         self.checked = None
+        self.calendar_acquired = None
         self.histories = {}
         self.history_acquired = {}
+        self.stopped = False
 
-    def completed(self, symbol, session):
+    def completed(self, symbol, session, *, deadline=None):
         """First usable completed daily result, separate from provisional events.
 
         No finality guarantee: provider corrections may occur later. Never alter
@@ -27,6 +35,15 @@ class Provider:
         """
         now = self.clock()
         cutoff = date.fromisoformat(session)
+        if cutoff > now.astimezone(ET).date():
+            return None
+        token = None
+        if session not in self.sessions:
+            budget(deadline)
+            token = load_token('production')
+            budget(deadline)
+            self.sessions.update(normalize_calendar(_get_json(token, 'production', 'calendar',
+                dict(year=cutoff.year, month=cutoff.month)), cutoff.year, cutoff.month))
         hours = self.sessions.get(session)
         if not hours:
             return None
@@ -34,8 +51,22 @@ class Provider:
         if now < close + timedelta(minutes=1):
             return None
         start = cutoff - timedelta(days=270)
+        month = start.replace(day=1)
+        while month <= cutoff:
+            # Recover full months for this cutoff, even after a long downtime.
+            dates = [str(date(month.year, month.month, d)) for d in range(1, calendar.monthrange(month.year, month.month)[1]+1)]
+            if any(d not in self.sessions for d in dates):
+                budget(deadline)
+                token = token or load_token('production')
+                budget(deadline)
+                self.sessions.update(normalize_calendar(_get_json(token, 'production', 'calendar',
+                    dict(year=month.year, month=month.month)), month.year, month.month))
+            month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
         expected = tuple(date.fromisoformat(d) for d, h in sorted(self.sessions.items()) if h and str(start) <= d <= session)
-        history = fetch_history(load_token('production'), symbol=symbol, environment='production',
+        budget(deadline)
+        token = token or load_token('production')
+        budget(deadline)
+        history = fetch_history(token, symbol=symbol, environment='production',
                                 start=start, end=cutoff, completed_through=cutoff)
         if tuple(b.session for b in history.bars) != expected or len(expected) < 100:
             raise ValueError('Completed history coverage unavailable')
@@ -55,13 +86,13 @@ class Provider:
         month = start.replace(day=1)
         sessions = {}
         while month <= today:
-            if deadline is not None and time.monotonic() >= deadline:
-                raise ValueError('Calendar acquisition budget exhausted')
+            budget(deadline)
             sessions.update(normalize_calendar(_get_json(token, 'production', 'calendar',
                                                          dict(year=month.year, month=month.month)), month.year, month.month))
             month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
         self.sessions = sessions
         self.checked = today
+        self.calendar_acquired = self.clock().isoformat()
         self.histories.clear()
         self.history_acquired.clear()
 
@@ -72,6 +103,7 @@ class Provider:
         19 minute requests thereafter. Stop starting requests after 90 seconds.
         """
         began = time.monotonic()
+        self.stopped = False
         token = load_token('production')
         now = self.clock()
         self.calendar(token, now, deadline=began + 90)
@@ -90,6 +122,7 @@ class Provider:
                 continue
             try:
                 if symbol not in self.histories:
+                    budget(began + 90)
                     history = fetch_history(token, symbol=symbol, environment='production', start=start,
                                             end=cutoff, completed_through=cutoff)
                     if len(expected) < 100 or tuple(b.session for b in history.bars) != expected:
@@ -100,6 +133,7 @@ class Provider:
                 at = self.clock()
                 if at >= closing:
                     raise ValueError('Market closed during acquisition')
+                budget(began + 90)
                 payload = _get_json(token, 'production', 'timesales', dict(symbol=symbol, interval='1min',
                     start=opening.strftime('%Y-%m-%d %H:%M'), end=at.astimezone(ET).strftime('%Y-%m-%d %H:%M'), session_filter='open'))
                 received = self.clock()
@@ -108,11 +142,14 @@ class Provider:
                 result = evaluate(symbol, history.bars, candle, observed, received, previous_session=cutoff)
                 result['history_evidence'] = [{k: str(v) if k == 'session' else v for k, v in asdict(b).items()} for b in history.bars]
                 result['minute_evidence'] = payload
-                result['calendar_evidence'] = {str(day): self.sessions[str(day)], 'previous_session': str(cutoff)}
+                result['calendar_evidence'] = dict(provider='Tradier production markets/calendar',
+                    acquired=self.calendar_acquired, previous_session=str(cutoff),
+                    sessions={d: h for d, h in self.sessions.items() if str(start) <= d <= str(day)})
                 result['history_acquired'] = self.history_acquired[symbol]
                 results.append(result)
             except (ValueError, TradierError) as error:
                 failures[symbol] = 'Unavailable: incomplete, stale, malformed or failed provider data'
                 stop = isinstance(error, TradierError) and error.stop_batch
+        self.stopped = stop
         return dict(state='Regular session', session=str(day), close=closing.isoformat(),
                     checked=self.clock().isoformat(), usable=len(results), configured=len(SYMBOLS)), results, failures

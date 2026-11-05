@@ -89,8 +89,10 @@ At most ten calendar, 19 history and 19 minute GETs on a usual cold start; warm
 sweeps use 19 minute GETs. Histories/calendars cache in process for the Eastern
 calendar day; restarts reacquire them. Acquisition stops starting new requests
 after 90 seconds (an outstanding bounded 15-second GET can finish later).
-Completed-close follow-up may add up to 19 history GETs within remaining sweep
-budget. There is no tick-level responsiveness, catch-up burst, streaming session,
+Completed-close follow-up may add up to 19 history GETs and any missing calendar
+months for the pending cutoff within remaining sweep budget. Each request checks
+the deadline again, including after history/credential preparation. Auth/quota
+stops apply across acquisition and follow-up phases. There is no tick-level responsiveness, catch-up burst, streaming session,
 network retry loop, or historical reconstruction of missed intraday alerts.
 
 Current minute excluded: aggregation ends at the final completed minute, normally
@@ -141,7 +143,9 @@ The current provisional candle cannot appear in historical input twice.
   separately calculated daily crossing. Later provider revisions are possible;
   this is not a guarantee of irreversible finality. Follow-up failures remain
   explicit and are revisited on later sweeps. It requires the monitor to run
-  after close or on a later invocation.
+  after close or on a later invocation. Pending cutoffs recover their own full
+  calendar window; least-recently-attempted selection prevents old failures from
+  starving newer follow-ups.
 
 ## Durable state and delivery
 
@@ -169,6 +173,8 @@ With separately authorized activation and `--send`, event formatting reuses the
 existing transport and 1024-character body / 250-character title preflight.
 Alerts show symbol, previous/current K, minute-close price, both observation
 identities, detection time, provisional status and lack of close confirmation.
+The session/freshness guard runs inside the transport immediately before opening
+HTTP, after potentially blocking credential lookup and request preparation.
 `intent_uncertain` is durable before transport. `api_accepted` means API acceptance
 only; any failure is `acceptance_unknown`. An interrupted intent is also uncertain.
 Neither is retried automatically. Phone receipt is never asserted or tracked.
@@ -184,7 +190,11 @@ sentinel --realtime XOM  # focused baseline, current candle and event evidence
 ```
 
 The viewer does **not** activate acquisition or notifications. It reads the monitor's
-ledger, prioritizes recent downward events, shows provisional K/D and price, state,
+ledger, sorts rows by **full-precision K ascending by default**, and offers D
+ascending links in both daily report details and realtime views. Unavailable
+values sort last with symbol as tie-breaker. This follows the Principal's later
+sorting direction and supersedes recent-crossing priority for table order;
+recent transitions remain in their own section. It shows provisional K/D and price, state,
 completed K/D, changes, freshness, coverage, last successful updates and recent
 transitions. Focus exposes full precision and provenance. All 19 rows remain
 visible even without data. Stale retained values are explicitly labeled; they
@@ -224,4 +234,16 @@ quota sharing; measure state growth; verify a separately authorized notification
 and phone receipt; arrange durable runtime, retention, failure visibility and
 installation rollback. Offline tests and independent engineering review establish
 candidate correctness only; they do not establish production readiness or
-Principal operator acceptance.
+Principal operator acceptance. In particular, unexplained sparse minute series
+are an **external all-19 coverage blocker**, not a passed feasibility gate or an
+implicit acceptance of reduced scope. The smallest next step is provider-backed
+confirmation of sparse-interval semantics (including trade eligibility/corrections)
+or a verified complete regular-session OHLC acquisition path. Quote-only aggregation
+must not be substituted until its regular-session and timestamp contract is verified.
+
+Independent review rejected frozen `0f8008d` despite 229 passing tests, identifying
+four boundary defects: credential-delay late sends, old close-result calendar
+coverage/starvation, follow-up auth/quota stopping, and a post-history acquisition
+deadline gap. The rejected candidate remains in Git history. The correction adds
+explicit falsifiers and the Principal's K/D sorting direction. See the retained
+review record in `docs/reviews/`; correction is subject to independent rereview.

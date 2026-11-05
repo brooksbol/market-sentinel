@@ -14,6 +14,7 @@ from datetime import date
 from html import escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from market_sentinel.universe import SYMBOLS
 
@@ -114,6 +115,15 @@ def fields(items):
     return '<dl>' + ''.join('<dt>' + escape(k) + '</dt><dd>' + text(v) + '</dd>' for k, v in items) + '</dl>'
 
 
+def indicator_order(symbol, value):
+    """Full-precision ascending indicator; missing/nonfinite last; symbol tie-break."""
+    try:
+        valid = type(value) in (int, float) and math.isfinite(value)
+    except OverflowError:
+        valid = False
+    return (not valid, value if valid else 0, symbol if isinstance(symbol, str) else '')
+
+
 def page(title, content):
     return ('<!doctype html><html lang="en"><meta charset="utf-8">'
             '<meta name="viewport" content="width=device-width, initial-scale=1">'
@@ -212,7 +222,7 @@ def result_detail(row):
     return cells, details
 
 
-def detail_page(root, identity):
+def detail_page(root, identity, sort_by='k'):
     value, error = report(root, identity)
     deliveries, ledger_error = ledger(root)
     item, status = delivery_info(deliveries, identity)
@@ -233,6 +243,9 @@ def detail_page(root, identity):
     if item.get('session') is not None and item['session'] != summary.get('completed_session'):
         content += '<p class="notice">Report and ledger data sessions disagree. Records may be changing; no combined delivery claim is established.</p>'
     rows, details, observed = [], [], []
+    results = sorted(results, key=lambda row: indicator_order(row.get('symbol'),
+                     (row.get('latest') or {}).get(sort_by)) if isinstance(row, dict) and
+                     isinstance(row.get('latest'), dict) else indicator_order('', None))
     for row in results:
         if not isinstance(row, dict):
             content += '<p class="notice">A symbol result is malformed.</p>'
@@ -246,6 +259,7 @@ def detail_page(root, identity):
     if summary.get('status') not in ('complete', 'complete_with_warnings'):
         content += '<p class="notice">Report is incomplete or its completion status is unavailable. Missing signals are unknown, not zero.</p>'
     content += '<h2>Stochastic 14-3-3 results</h2><p>Retained K and D values; no recalculation. Unknown means unavailable or unrecorded.</p>'
+    content += f'<p>Sort ascending: <a href="/reports/{identity}?sort=k">K</a> · <a href="/reports/{identity}?sort=d">D</a>. Current: {sort_by.upper()}.</p>'
     content += table(['Symbol', 'Close', 'K', 'D', 'Crossed below 20', 'Source status', 'Warnings'], rows)
     content += '<h2>Notification record</h2>' + delivery_content
     content += '<h2>Source details</h2>' + ''.join(details)
@@ -262,14 +276,22 @@ def make_server(root=RUNTIME, port=8765, *, live_state=None):
                     None, f'http://127.0.0.1:{port}', f'http://localhost:{port}'):
                 self.respond(403, page('Forbidden', '<p>Local browser access only.</p>'))
                 return
-            if self.path == '/':
+            route = urlsplit(self.path)
+            params = parse_qs(route.query, keep_blank_values=True)
+            sort_by = params.get('sort', ['k'])
+            if set(params) - {'sort'} or len(sort_by) != 1 or sort_by[0] not in ('k', 'd'):
+                self.respond(404, page('Not found', '<p>Invalid sort selection.</p>'))
+                return
+            sort_by = sort_by[0]
+            path = route.path
+            if path == '/':
                 self.respond(200, list_page(Path(root)))
-            elif live_state is not None and (self.path == '/realtime' or
-                    self.path.startswith('/realtime/') and self.path[10:] in SYMBOLS):
+            elif live_state is not None and (path == '/realtime' or
+                    path.startswith('/realtime/') and path[10:] in SYMBOLS):
                 from market_sentinel.realtime_view import live_page
-                self.respond(200, live_page(live_state, self.path[10:] or None))
-            elif self.path.startswith('/reports/') and valid_slot(self.path[9:]):
-                self.respond(200, detail_page(Path(root), self.path[9:]))
+                self.respond(200, live_page(live_state, path[10:] or None, sort_by=sort_by))
+            elif path.startswith('/reports/') and valid_slot(path[9:]):
+                self.respond(200, detail_page(Path(root), path[9:], sort_by))
             else:
                 self.respond(404, page('Not found', '<p>Report route not found.</p>'))
 

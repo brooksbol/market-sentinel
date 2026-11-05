@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from market_sentinel.intraday_state import read_view
-from market_sentinel.report_history import fields, page, table, text
+from market_sentinel.report_history import fields, indicator_order, page, table, text
 from market_sentinel.universe import SYMBOLS
 
 
@@ -13,7 +13,7 @@ def default_state():
     return Path(os.environ.get('XDG_STATE_HOME', Path.home() / '.local/state')) / 'market-sentinel/intraday/state.sqlite3'
 
 
-def live_page(path, focus=None, *, now=None):
+def live_page(path, focus=None, *, now=None, sort_by='k'):
     now = now or datetime.now(timezone.utc)
     try:
         view = read_view(path)
@@ -22,10 +22,12 @@ def live_page(path, focus=None, *, now=None):
     status = view['status']
     latest = {r['symbol']: r for r in view['latest']}
     events = [e for e in view['events'] if focus is None or e['current']['symbol'] == focus]
-    recent = list(dict.fromkeys(e['current']['symbol'] for e in events if e['type'] == 'entered_oversold'))
-    symbols = [focus] if focus else sorted(SYMBOLS, key=lambda s: (recent.index(s) if s in recent else 100, s))
+    symbols = [focus] if focus else sorted(SYMBOLS, key=lambda s: indicator_order(s,
+                   (latest.get(s, {}).get('observation') or {}).get(sort_by)))
     content = '<style>body{max-width:1500px}table{font-size:14px;font-variant-numeric:tabular-nums}th,td{padding:.45rem}th{white-space:normal}</style>'
     content += '<p class="notice">Provisional daily Stochastic(14,3,3). Not confirmed at close. Viewing does not start monitoring or send alerts.</p>'
+    route = '/realtime' + ('/' + focus if focus else '')
+    content += f'<p><a href="/realtime?sort={sort_by}">All 19 symbols</a> · Sort ascending: <a href="{route}?sort=k">K</a> · <a href="{route}?sort=d">D</a>. Current: {sort_by.upper()}.</p>'
     content += fields([('Monitor', status.get('state')), ('Last check', status.get('checked')),
                        ('Last successful update', status.get('last_successful_update')),
                        ('Usable coverage at last sweep', status.get('usable')),
@@ -46,7 +48,7 @@ def live_page(path, focus=None, *, now=None):
         state = ('Oversold' if k < 20 else 'Overbought' if k > 80 else 'Neutral') if k is not None else 'Unavailable'
         delta = lambda key: (obs[key] - baseline[key]) if obs.get(key) is not None and baseline.get(key) is not None else None
         number = lambda v: f'{v:.2f}' if type(v) in (int, float) else '—'
-        rows.append([f'<a href="/realtime/{symbol}">{symbol}</a>', number(obs.get('price')), number(k), number(d),
+        rows.append([f'<a href="/realtime/{symbol}?sort={sort_by}">{symbol}</a>', number(obs.get('price')), number(k), number(d),
                      text(state), text(baseline.get('session')), number(baseline.get('k')) + ' / ' + number(baseline.get('d')),
                      number(delta('k')) + ' / ' + number(delta('d')), text(age_text), 'Fresh' if fresh else 'Degraded / stale / unavailable'])
     content += table(['Symbol', 'Price at minute end', 'Provisional K', 'Provisional D', 'Technical state',

@@ -17,6 +17,7 @@ from market_sentinel.sessions import ET, normalize_calendar
 from market_sentinel.stochastic import DailyOHLC, stochastic_14_3_3
 from market_sentinel.universe import SYMBOLS
 from test_scheduled_report import month_payload
+from test_daily_report import screening
 
 OPEN = datetime(2026, 11, 5, 9, 30, tzinfo=ET)
 CLOSE = OPEN.replace(hour=16, minute=0)
@@ -319,8 +320,94 @@ class MonitorTests(Offline):
             self.assertEqual(make.call_args.kwargs['live_state'],self.path)
             self.assertEqual(thread.call_args.kwargs['args'],('http://127.0.0.1:8765/realtime/XOM',))
 
+    def test_slow_credentials_cannot_start_http_after_close_or_staleness(self):
+        for symbol, late in zip(('XOM','CVX'), (CLOSE+timedelta(seconds=19),NOW+timedelta(minutes=4))):
+            state={'now':NOW}
+            def credentials():
+                state['now']=late
+                return 'a'*30,'b'*30
+            ledger=self.ledger()
+            with patch.object(realtime,'load_credentials',side_effect=credentials), patch('market_sentinel.pushover.build_opener') as build:
+                realtime.run_once(self.provider(observation(symbol=symbol)),ledger,send=True,clock=lambda:state['now'])
+                build.return_value.open.assert_not_called()
+            self.assertEqual(read_view(self.path)['events'][0]['delivery'],'acceptance_unknown')
+
+    def test_post_history_budget_prevents_new_minute_request(self):
+        provider=intraday_provider.Provider(clock=lambda:NOW)
+        provider.checked=OPEN.date()
+        for month in range(2,12): provider.sessions.update(normalize_calendar(month_payload(2026,month),2026,month))
+        elapsed={'value':0}
+        def fetch(token,**kwargs):
+            elapsed['value']=91
+            return Mock(bars=tuple(DailyOHLC(date.fromisoformat(d),60,110,10,35) for d,h in sorted(provider.sessions.items()) if h and str(kwargs['start'])<=d<=str(kwargs['end'])))
+        with patch.object(intraday_provider,'load_token',return_value='synthetic'), patch.object(intraday_provider,'fetch_history',side_effect=fetch), patch.object(intraday_provider.time,'monotonic',side_effect=lambda:elapsed['value']), patch.object(intraday_provider,'_get_json') as minute:
+            status,results,failures=provider.poll()
+        minute.assert_not_called(); self.assertEqual(len(failures),19)
+
+    def test_old_completed_cutoff_recovers_its_own_calendar(self):
+        later=datetime(2026,11,30,17,tzinfo=ET)
+        provider=intraday_provider.Provider(clock=lambda:later)
+        for month in range(2,12): provider.sessions.update(normalize_calendar(month_payload(2026,month),2026,month))
+        def calendar_get(token,environment,endpoint,params):
+            self.assertEqual(endpoint,'calendar')
+            return month_payload(params['year'],params['month'])
+        def fetch(token,**kwargs):
+            return Mock(bars=tuple(DailyOHLC(date.fromisoformat(d),60,110,10,35) for d,h in sorted(provider.sessions.items()) if h and str(kwargs['start'])<=d<=str(kwargs['end'])))
+        with patch.object(intraday_provider,'load_token',return_value='synthetic'),patch.object(intraday_provider,'_get_json',side_effect=calendar_get) as calendar_get_mock,patch.object(intraday_provider,'fetch_history',side_effect=fetch):
+            result=provider.completed('XOM','2026-09-15')
+        self.assertEqual(result['k'],25)
+        self.assertGreater(len(result['history']),100)
+        self.assertEqual(calendar_get_mock.call_count,2)  # Dec25 and Jan26 absent from current window.
+
+    def test_followup_auth_quota_stop_and_old_pending_work_cannot_starve(self):
+        ledger=self.ledger()
+        for day in ('2026-11-04','2026-11-05'):
+            for symbol in SYMBOLS:
+                obs=observation(symbol=symbol)
+                obs['session']=day
+                obs['observed']=obs['observed'].replace('2026-11-05',day)
+                ledger.record(obs)
+        provider=self.provider(); provider.stopped=False
+        provider.poll.return_value=(dict(state='Market closed'),[],{})
+        provider.completed.side_effect=tradier.TradierError('safe',stop_batch=True)
+        realtime.run_once(provider,ledger,clock=lambda:NOW)
+        self.assertEqual(provider.completed.call_count,1)
+        # Rotate attempted old work behind unattempted work.
+        for symbol,day in ledger.pending_completions(): ledger.completion_checked(symbol,day,NOW.isoformat())
+        self.assertTrue(any(day=='2026-11-05' for symbol,day in ledger.pending_completions()))
+        provider.completed.reset_mock();provider.stopped=False
+        provider.poll.side_effect=tradier.TradierError('safe',stop_batch=True)
+        realtime.run_once(provider,ledger,clock=lambda:NOW)
+        provider.completed.assert_not_called()
+
 
 class PresentationTests(Offline):
+    def test_daily_and_realtime_sort_full_precision_k_or_d_missing_last(self):
+        data=screening()
+        # Equal displayed K must retain unrounded order; unavailable stays last.
+        for i,row in enumerate(data['results']): row['latest'].update(k=50+i,d=70-i)
+        data['results'][0]['latest'].update(k=19.9999,d=None)
+        data['results'][1]['latest'].update(k=19.9991,d=1)
+        data['results'][2]['latest'].update(k=None,d=2)
+        root=Path(self.tmp.name)
+        (root/'2026-11-05-closing.json').write_text(json.dumps(data))
+        (root/'state.json').write_text(json.dumps(dict(version=1,deliveries={})))
+        for sort_by in ('k','d'):
+            html=report_history.detail_page(root,'2026-11-05-closing',sort_by)
+            expected=sorted(data['results'],key=lambda r: report_history.indicator_order(r['symbol'],r['latest'][sort_by]))
+            offsets=[html.index('<td>'+r['symbol']+'</td>') for r in expected]
+            self.assertEqual(offsets,sorted(offsets))
+        ledger=self.ledger()
+        for i,symbol in enumerate(SYMBOLS):
+            obs=observation(50+i,symbol=symbol);obs['d']=70-i
+            ledger.record(obs)
+        khtml=realtime_view.live_page(self.path,now=NOW)
+        dhtml=realtime_view.live_page(self.path,now=NOW,sort_by='d')
+        korder=[khtml.index('>'+s+'</a>') for s in SYMBOLS]
+        dorder=[dhtml.index('>'+s+'</a>') for s in reversed(SYMBOLS)]
+        self.assertEqual(korder,sorted(korder));self.assertEqual(dorder,sorted(dorder))
+        self.assertIn('All 19 symbols',realtime_view.live_page(self.path,'XOM',now=NOW))
+
     def test_all_symbols_focus_freshness_and_completed_relationship(self):
         ledger=self.ledger(); ledger.record(observation())
         ledger.status(dict(state='Regular session',checked=NOW.isoformat(),usable=1,failures={'CLX':'Minute gaps'}))

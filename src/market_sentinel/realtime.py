@@ -8,8 +8,9 @@ from pathlib import Path
 
 from market_sentinel.intraday import session_bounds
 from market_sentinel.intraday_provider import Provider
-from market_sentinel.intraday_state import Ledger
+from market_sentinel.intraday_state import Ledger, read_view
 from market_sentinel.pushover import _send_message, load_credentials, validate_message
+from market_sentinel.tradier import TradierError
 from market_sentinel.universe import SYMBOLS
 
 TITLE = 'Market Sentinel — Intraday Oversold'
@@ -34,20 +35,21 @@ def alert_body(event):
     return body
 
 
-def send_alert(event):
+def send_alert(event, *, before_request=None):
     body = alert_body(event)
     token, user = load_credentials()
-    _send_message(token, user, title=TITLE, message=body)
+    _send_message(token, user, title=TITLE, message=body, before_request=before_request)
 
 
-def run_once(provider, ledger, *, send=False, notify=send_alert, clock=lambda: datetime.now(timezone.utc)):
+def run_once(provider, ledger, *, send=False, notify=None, clock=lambda: datetime.now(timezone.utc)):
     """Persist evidence before any send. Never replay intents or old events."""
     started = time.monotonic()
     try:
         status, results, failures = provider.poll()
-    except Exception:
+    except Exception as error:
         status, results = dict(state='Acquisition unavailable', checked=clock().isoformat()), []
         failures = {s: 'Provider/calendar/credential failure; details suppressed' for s in SYMBOLS}
+        provider.stopped = True  # No second acquisition phase after an unusable setup/calendar sweep.
     for symbol in failures:
         ledger.degraded(symbol)
     events = []
@@ -57,7 +59,7 @@ def run_once(provider, ledger, *, send=False, notify=send_alert, clock=lambda: d
         now = clock()
         bounds = session_bounds(now, provider.sessions)
         observed = datetime.fromisoformat(result['observed'])
-        if bounds is None or not bounds[0] <= now < bounds[1] or (now - observed).total_seconds() > 180:
+        if bounds is None or not bounds[0] <= now < bounds[1] or not 0 <= (now - observed).total_seconds() <= 180:
             ledger.degraded(result['symbol'])
             failures[result['symbol']] = 'Stale or market closed before evaluation'
             continue
@@ -70,10 +72,15 @@ def run_once(provider, ledger, *, send=False, notify=send_alert, clock=lambda: d
             if event['policy'] == 'send_reserved':
                 try:
                     # Intent is committed. Any exception leaves acceptance unknown.
-                    delivery_now = clock()
-                    if delivery_now >= bounds[1] or (delivery_now - observed).total_seconds() > 180:
-                        raise ValueError('Session ended before notification')
-                    notify(event)
+                    def guard():
+                        delivery_now = clock()
+                        if not bounds[0] <= delivery_now < bounds[1] or not 0 <= (delivery_now - observed).total_seconds() <= 180:
+                            raise ValueError('Session or freshness expired before notification')
+                    if notify is None:
+                        send_alert(event, before_request=guard)
+                    else:
+                        guard()
+                        notify(event)
                 except Exception:
                     ledger.outcome(event['id'], 'acceptance_unknown', clock().isoformat())
                 else:
@@ -81,15 +88,21 @@ def run_once(provider, ledger, *, send=False, notify=send_alert, clock=lambda: d
     status.update(failures=failures, sending_enabled=send, cadence_seconds=CADENCE)
     completion_failures = []
     for symbol, session in ledger.pending_completions():
+        if getattr(provider, 'stopped', False) is True:
+            completion_failures.append('Authentication or quota stopped follow-up batch')
+            break
         if time.monotonic() - started > 90:
             completion_failures.append('Sweep budget exhausted; follow-up deferred')
             break
         try:
-            completed = provider.completed(symbol, session)
+            ledger.completion_checked(symbol, session, clock().isoformat())
+            completed = provider.completed(symbol, session, deadline=started + 90)
             if completed:
                 ledger.complete(symbol, session, completed)
-        except Exception:
+        except Exception as error:
             completion_failures.append(symbol + ':' + session)
+            if isinstance(error, TradierError) and error.stop_batch:
+                provider.stopped = True
     status['completed_result_unavailable'] = completion_failures
     status['usable'] = len(results) - sum(r['symbol'] in failures for r in results)
     if status['usable']:
@@ -111,6 +124,10 @@ def main(argv=None):
         while True:
             run_once(provider, ledger, send=args.send)
             if not args.loop:
+                status = read_view(args.state)['status']
+                if status.get('state') == 'Acquisition unavailable' or (status.get('state') == 'Regular session' and status.get('usable', 0) < len(SYMBOLS)):
+                    print('Intraday sweep has degraded coverage; inspect the realtime view or retained ledger.')
+                    return 1
                 break
             # No catch-up burst or retries. One sweep at most per cadence.
             time.sleep(CADENCE)

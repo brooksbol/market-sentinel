@@ -36,6 +36,7 @@ class Ledger:
             CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, symbol TEXT, session TEXT, body TEXT NOT NULL, policy TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS attempts(event TEXT PRIMARY KEY, status TEXT NOT NULL, at TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS completions(symbol TEXT, session TEXT, body TEXT NOT NULL, PRIMARY KEY(symbol, session));
+            CREATE TABLE IF NOT EXISTS completion_checks(symbol TEXT, session TEXT, checked TEXT, PRIMARY KEY(symbol, session));
             CREATE TABLE IF NOT EXISTS status(id INTEGER PRIMARY KEY CHECK(id=1), body TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS runs(id INTEGER PRIMARY KEY, body TEXT NOT NULL);
             PRAGMA user_version=1;
@@ -116,7 +117,11 @@ class Ledger:
             self.db.execute('INSERT INTO runs(body) VALUES (?)', (encoded(value),))
 
     def pending_completions(self):
-        return self.db.execute('SELECT DISTINCT e.symbol, e.session FROM events e LEFT JOIN completions c ON c.symbol=e.symbol AND c.session=e.session WHERE c.symbol IS NULL AND json_extract(e.body,\'$.type\')=\'entered_oversold\' ORDER BY e.session, e.symbol LIMIT 19').fetchall()
+        return self.db.execute('SELECT DISTINCT e.symbol, e.session FROM events e LEFT JOIN completions c ON c.symbol=e.symbol AND c.session=e.session LEFT JOIN completion_checks x ON x.symbol=e.symbol AND x.session=e.session WHERE c.symbol IS NULL AND json_extract(e.body,\'$.type\')=\'entered_oversold\' ORDER BY COALESCE(x.checked,\'\'), e.session, e.symbol LIMIT 19').fetchall()
+
+    def completion_checked(self, symbol, session, at):
+        with self.db:
+            self.db.execute('INSERT INTO completion_checks VALUES (?, ?, ?) ON CONFLICT(symbol, session) DO UPDATE SET checked=excluded.checked', (symbol, session, at))
 
     def complete(self, symbol, session, evidence):
         with self.db:
