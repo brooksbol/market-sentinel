@@ -190,12 +190,13 @@ class WorkerTests(unittest.TestCase):
     def test_data_failure_delays_and_retries_without_false_quiet_push(self):
         self.acquire.side_effect = RuntimeError("synthetic-secret")
         self.assertEqual(worker.run_once(self.root, NOW), 1)
-        self.send.assert_not_called()
+        self.assertEqual(self.send.call_count, 1)  # Genuine operational alert, not a market report.
+        self.assertEqual(self.send.call_args.args[2], worker.FAILURE_TITLE)
         worker.run_once(self.root, NOW + timedelta(minutes=1))
         self.assertEqual(self.acquire.call_count, 1)
         self.acquire.side_effect = None
         worker.run_once(self.root, NOW + timedelta(minutes=15))
-        self.assertEqual(self.send.call_count, 1)
+        self.assertEqual(self.send.call_count, 2)  # One alert, then the recovered market report.
         self.assertNotIn("synthetic-secret", (self.root / "state.json").read_text())
 
     def test_push_ambiguous_failure_never_retried(self):
@@ -233,10 +234,11 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual([str(call.args[1]) for call in self.acquire.call_args_list],
                          ["2026-10-30", "2026-11-02", "2026-11-02", "2026-11-03", "2026-11-03", "2026-11-04"])
 
-    def test_calendar_failure_stops_before_prices_or_push(self):
+    def test_calendar_failure_stops_prices_and_sends_only_operational_alert(self):
         self.http.side_effect = RuntimeError("synthetic-secret")
         self.assertEqual(worker.run_once(self.root, NOW), 1)
-        self.acquire.assert_not_called(); self.send.assert_not_called()
+        self.acquire.assert_not_called()
+        self.assertEqual(self.send.call_args.args[2], worker.FAILURE_TITLE)
 
     def test_malformed_ledger_never_reset(self):
         (self.root / "state.json").write_text("bad")

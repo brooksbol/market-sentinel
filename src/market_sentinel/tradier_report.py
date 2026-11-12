@@ -37,6 +37,8 @@ def history_report(history):
         continuity="UNVERIFIED: no exchange calendar; missing sessions cannot be enumerated",
         duplicates=0, rejected=0, reordered=history.reordered,
         excluded_sessions=[str(day) for day in history.excluded_sessions],
+        excluded_old_sessions=[str(day) for day in history.excluded_old_sessions],
+        invalid_old_sessions=[str(day) for day in history.invalid_old_sessions],
         missing_volume_sessions=[str(bar.session) for bar, volume in zip(history.bars, history.volumes)
                                  if volume is None],
         adjustment="Tradier prices as supplied. Documented split-adjusted; mixed dividend-related historical close conventions accepted for screening without repair.",

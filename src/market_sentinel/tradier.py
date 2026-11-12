@@ -41,6 +41,8 @@ class History:
     excluded_sessions: tuple[date, ...]
     reordered: bool
     warnings: tuple[RangeWarning, ...] = ()
+    excluded_old_sessions: tuple[date, ...] = ()
+    invalid_old_sessions: tuple[date, ...] = ()
 
 
 def _environment(environment):
@@ -92,11 +94,14 @@ def _session(value):
     return session
 
 
-def normalize_history(payload, *, symbol, environment, start, end, completed_through) -> History:
+def normalize_history(payload, *, symbol, environment, start, end, completed_through,
+                      exclude_older=False) -> History:
     """Validate all rows oldest first, exclude dates after caller-certified cutoff.
 
     No exchange calendar is inferred: weekday holidays and missing sessions remain
-    unverified. Reject the entire response on invalid rows, including excluded rows.
+    unverified. By default reject invalid rows, including excluded future rows.
+    Scheduled recent-window callers may exclude dated rows strictly before start;
+    retain dates/counts of those rows and their invalid OHLC, never their raw values.
     Optional/null volume remains None; supplied volume must be finite/nonnegative.
     """
     _environment(environment)
@@ -112,15 +117,25 @@ def normalize_history(payload, *, symbol, environment, start, end, completed_thr
     parsed = []
     warnings = []
     seen = set()
+    excluded_old, invalid_old = [], []
+    previous = None
     for row in rows:
         if not isinstance(row, dict):
             raise TradierError("Malformed daily history observation.")
         session = _session(row.get("date"))
         if session in seen:
             raise TradierError("Duplicate historical session; no indicator calculated.")
-        if parsed and session <= parsed[-1][0].session:
+        if previous is not None and session <= previous:
             raise TradierError("Historical sessions must be strictly increasing; no sorting performed.")
         seen.add(session)
+        previous = session
+        if exclude_older and session < start:
+            excluded_old.append(session)
+            try:
+                _validated([DailyOHLC(session, *(row[key] for key in ("open", "high", "low", "close")))])
+            except (KeyError, ValueError, TypeError, OverflowError):
+                invalid_old.append(session)
+            continue
         if not start <= session <= end:
             raise TradierError("Historical session outside requested range.")
         try:
@@ -144,7 +159,7 @@ def normalize_history(payload, *, symbol, environment, start, end, completed_thr
     return History(symbol, environment, start, end, completed_through,
                    tuple(bar for bar, _ in completed), tuple(volume for _, volume in completed),
                    tuple(bar.session for bar, _ in parsed if bar.session > completed_through),
-                   False, tuple(warnings))
+                   False, tuple(warnings), tuple(excluded_old), tuple(invalid_old))
 
 
 class _NoRedirects(HTTPRedirectHandler):
@@ -153,7 +168,8 @@ class _NoRedirects(HTTPRedirectHandler):
 
 
 def fetch_history(token: str, *, symbol: str, environment: str,
-                  start: date, end: date, completed_through: date) -> History:
+                  start: date, end: date, completed_through: date,
+                  exclude_older=False) -> History:
     """One fixed-endpoint GET with bounded read/timeout; no retries or raw error output.
 
     Caller certifies cutoff is a completed session. API presence alone is insufficient.
@@ -166,7 +182,8 @@ def fetch_history(token: str, *, symbol: str, environment: str,
     payload = _get_json(token, environment, "history", dict(
         symbol=symbol, interval="daily", start=start.isoformat(), end=end.isoformat()))
     return normalize_history(payload, symbol=symbol, environment=environment,
-                             start=start, end=end, completed_through=completed_through)
+                             start=start, end=end, completed_through=completed_through,
+                             exclude_older=exclude_older)
 
 
 def _get_json(token, environment, endpoint, parameters):

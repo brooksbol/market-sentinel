@@ -26,6 +26,9 @@ ET = ZoneInfo("America/New_York")
 LABEL_JOB = "com.market-sentinel.daily-reports"
 RUNTIME = Path.home() / "Library/Application Support/Market Sentinel/automatic-reports"
 RETRY_SECONDS = 900
+# STOCH(14,SMA3,SMA3) lookback 17, plus two adjacent available K/D points.
+HISTORY_SESSIONS = 19
+FAILURE_TITLE = "Market Sentinel: report unavailable"
 
 
 class ScheduleError(ValueError):
@@ -91,15 +94,20 @@ def due_reports(now, activated, sessions):
 
 def acquire_screening(token, cutoff, sessions):
     """One GET per symbol; require exact exchange-calendar coverage before sending."""
-    start = cutoff - timedelta(days=270)
     expected = tuple(date.fromisoformat(day) for day, hours in sorted(sessions.items())
-                     if hours is not None and str(start) <= day <= str(cutoff))
-    if len(expected) < 100:
+                     if hours is not None and day <= str(cutoff))[-HISTORY_SESSIONS:]
+    if len(expected) != HISTORY_SESSIONS or expected[-1] != cutoff:
         raise ScheduleError("Insufficient verified historical calendar coverage.")
+    start = expected[0]
+    if any(str(start + timedelta(days=n)) not in sessions for n in range((cutoff-start).days+1)):
+        raise ScheduleError("Incomplete recent exchange calendar; report delayed.")
     results = []
     for symbol in SYMBOLS:
-        history = fetch_history(token, symbol=symbol, environment="production", start=start,
-                                end=cutoff, completed_through=cutoff)
+        try:
+            history = fetch_history(token, symbol=symbol, environment="production", start=start,
+                                    end=cutoff, completed_through=cutoff, exclude_older=True)
+        except TradierError as error:
+            raise ScheduleError(symbol + ": " + str(error)) from None
         if tuple(bar.session for bar in history.bars) != expected:
             raise ScheduleError("Missing, stale or unexpected daily bars for " + symbol + "; report delayed.")
         report = history_report(history)
@@ -109,6 +117,8 @@ def acquire_screening(token, cutoff, sessions):
         results.append(report)
     warnings = sum(row["warning_count"] for row in results)
     return dict(label=LABEL, notice=NOTICE, evidence_timestamp=datetime.now(timezone.utc).isoformat(),
+                calculation_policy=dict(completed_exchange_sessions=HISTORY_SESSIONS,
+                                        basis="Recent contiguous sessions; TA-Lib STOCH(14,3,3) SMA"),
                 summary=dict(provider="Tradier", environment="production", completed_session=str(cutoff),
                              configured_symbols=19, acquired_symbols=19, evaluated_symbols=19, usable_latest_symbols=19,
                              new_downward_crossings=sum(row["latest"]["crossed_below_20"] for row in results),
@@ -155,6 +165,13 @@ def read_state(root):
     for item in state["deliveries"].values():
         if item.get("status") not in ("accepted", "attempting", "unknown", "waiting"):
             raise ScheduleError("Invalid delivery status; operator inspection required.")
+    if not isinstance(state.get("calendar_failures", {}), dict):
+        raise ScheduleError("Invalid calendar failure ledger; operator inspection required.")
+    for item in list(state["deliveries"].values()) + list(state.get("calendar_failures", {}).values()):
+        if "failure_alert" in item:
+            alert = item["failure_alert"]
+            if not isinstance(alert, dict) or alert.get("status") not in ("accepted", "attempting", "unknown", "waiting"):
+                raise ScheduleError("Invalid operational alert status; operator inspection required.")
     return state
 
 
@@ -168,12 +185,55 @@ def log(root, now, status, slot=None):
         stream.write(json.dumps(dict(at=now.isoformat(), status=status, slot=slot)) + "\n")
 
 
-def run_once(root, now=None):
-    """At most one report per invocation; recover backlog chronologically.
+def safe_failure(error):
+    return (str(error) if type(error) in (ScheduleError, TradierError)
+            else "Acquisition/calendar/credentials/preflight failure; details suppressed.")
 
-    An intent is persisted BEFORE HTTP. Any send exception/crash blocks automatic
-    retry of that slot, including definitive rejection: operator review is safer
-    than duplicate notification. Future slots remain independent.
+
+def failure_alert(root, state, record, identity, now):
+    """One operational alert per report slot (calendar failures: one per ET day).
+
+    Credential/preflight failures are safe to retry on the next acquisition retry.
+    Persist intent before HTTP; accepted/unknown/interrupted alerts never resend.
+    A recovered market report is the recovery notification, not another alert.
+    """
+    alert = record.setdefault("failure_alert", {})
+    if alert.get("status") == "attempting":
+        alert["status"] = "unknown"
+        save_json(root / "state.json", state)
+    if alert.get("status") in ("accepted", "unknown"):
+        return
+    body = (f"Report unavailable: {identity} ET\n"
+            + record["last_failure"]["status"][:600]
+            + "\nAcquisition retries every 15 minutes; other eligible slots continue."
+              " No market report was sent for this attempt.")
+    try:
+        validate_message(FAILURE_TITLE, body)
+        app_token, user_key = load_credentials()
+    except Exception:
+        alert.update(status="waiting", last_check=now.isoformat(),
+                     reason="Operational alert credentials/preflight unavailable; no send attempted.")
+        save_json(root / "state.json", state)
+        log(root, now, alert["reason"], identity)
+        return
+    alert.update(status="attempting", attempted=now.isoformat())
+    save_json(root / "state.json", state)
+    try:
+        _send_message(app_token, user_key, FAILURE_TITLE, body, monospace=False)
+    except Exception:
+        alert["status"] = "unknown"
+        log(root, now, "Operational alert acceptance unknown; no automatic resend.", identity)
+    else:
+        alert.update(status="accepted", accepted=datetime.now(timezone.utc).isoformat())
+        log(root, now, "Operational alert API accepted; phone receipt not confirmed.", identity)
+    save_json(root / "state.json", state)
+
+
+def run_once(root, now=None):
+    """One eligible acquisition per tick; failed slots have independent backoff.
+
+    Never-attempted slots precede retries, then oldest last acquisition first.
+    Accepted/unknown report and operational-alert sends never automatically resend.
     """
     now = now or datetime.now(timezone.utc)
     with (root / "worker.lock").open("a") as lock:
@@ -183,13 +243,22 @@ def run_once(root, now=None):
         except BlockingIOError:
             return 0
         state = read_state(root)
-        if now.timestamp() < state.get("retry_after", 0):
+        interrupted = False
+        for record in list(state["deliveries"].values()) + list(state.get("calendar_failures", {}).values()):
+            alert = record.get("failure_alert", {})
+            if alert.get("status") == "attempting":
+                alert["status"] = "unknown"
+                interrupted = True
+        if interrupted:
+            save_json(root / "state.json", state)
+            log(root, now, "Previous operational alert interrupted; acceptance unknown. No automatic retry.")
+        if state.get("retry_scope") == "calendar" and now.timestamp() < state.get("retry_after", 0):
             return 0
         try:
             today = now.astimezone(ET).date()
             activated = date.fromisoformat(state["activated"])
-            # All months required for activation-to-now catch-up and 270-day history.
-            first = activated - timedelta(days=274)
+            # Complete months supply catch-up slots and the 19-session window.
+            first = activated - timedelta(days=90)
             month = date(first.year, first.month, 1)
             token = None
             while month <= today:
@@ -203,52 +272,82 @@ def run_once(root, now=None):
                     state["calendars"][key] = dict(checked=str(today), days=days)
                 month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
             sessions = {day: hours for entry in state["calendars"].values() for day, hours in entry["days"].items()}
-            pending = []
-            for slot in due_reports(now, activated, sessions):
-                delivered = state["deliveries"].get(slot["id"], {})
-                if delivered.get("status") == "attempting":
-                    delivered["status"] = "unknown"
-                    log(root, now, "Previous send interrupted; acceptance unknown. No automatic retry.", slot["id"])
-                if delivered.get("status") in ("accepted", "unknown"):
-                    continue
-                pending.append(slot)
-            if not pending:
-                state["last_check"] = now.isoformat()
-                save_json(root / "state.json", state)
-                return 0
-            slot = pending[0]
-            delivery = state["deliveries"].get(slot["id"], {})
-            if now.timestamp() < delivery.get("retry_after", 0):
-                save_json(root / "state.json", state)
-                return 0
-            # No personal account/order endpoint is ever used.
+            due = due_reports(now, activated, sessions)
+        except Exception as error:
+            state.update(retry_after=now.timestamp() + RETRY_SECONDS, retry_scope="calendar")
+            state["last_failure"] = dict(at=now.isoformat(), status=safe_failure(error) + " No report sent.")
+            record = state.setdefault("calendar_failures", {}).setdefault(str(now.astimezone(ET).date()), {})
+            record["last_failure"] = state["last_failure"]
+            save_json(root / "state.json", state)
+            log(root, now, state["last_failure"]["status"])
+            # Cached calendar can identify the affected slots; never invent a session.
+            try:
+                cached = {day: hours for entry in state["calendars"].values() for day, hours in entry["days"].items()}
+                identities = [slot["id"] for slot in due_reports(now, date.fromisoformat(state["activated"]), cached)
+                              if state["deliveries"].get(slot["id"], {}).get("status") not in ("accepted", "unknown")]
+            except Exception:
+                identities = []
+            failure_alert(root, state, record, ", ".join(identities)[:200] or "scheduled slots (calendar unavailable)", now)
+            return 1
+        pending = []
+        for slot in due:
+            delivered = state["deliveries"].get(slot["id"], {})
+            if delivered.get("status") == "attempting":
+                delivered["status"] = "unknown"
+                log(root, now, "Previous send interrupted; acceptance unknown. No automatic retry.", slot["id"])
+            if delivered.get("status") in ("accepted", "unknown"):
+                continue
+            pending.append(slot)
+        # Preserve a legacy pre-send failure/backoff, but attach it to its slot.
+        if pending and state.get("retry_scope") != "calendar" and state.get("retry_after", 0):
+            record = state["deliveries"].setdefault(pending[0]["id"], dict(pending[0], status="waiting"))
+            record.setdefault("retry_after", state["retry_after"])
+            if state.get("last_failure"):
+                record.setdefault("last_failure", state["last_failure"])
+                record.setdefault("last_attempt", state["last_failure"]["at"])
+        state.update(retry_after=0, retry_scope="calendar")
+        state["last_check"] = now.isoformat()
+        eligible = [slot for slot in pending if now.timestamp() >= state["deliveries"].get(slot["id"], {}).get("retry_after", 0)]
+        if not eligible:
+            save_json(root / "state.json", state)
+            return 0
+        def priority(item):
+            attempted = state["deliveries"].get(item["id"], {}).get("last_attempt")
+            return (datetime.fromisoformat(attempted).timestamp() if attempted else float("-inf"), item["due"])
+        slot = min(eligible, key=priority)
+        record = state["deliveries"].setdefault(slot["id"], dict(slot, status="waiting"))
+        record["last_attempt"] = now.isoformat()
+        try:
             token = token or load_token("production")
             screening = acquire_screening(token, date.fromisoformat(slot["session"]), sessions)
             body = notification_body(screening, slot)
-            app_token, user_key = load_credentials()
             save_json(root / (slot["id"].replace(":", "-") + ".json"), screening)
+            app_token, user_key = load_credentials()
         except Exception as error:
-            # Data and credential failures occur before send intent: bounded retry.
-            state["retry_after"] = now.timestamp() + RETRY_SECONDS
-            diagnostic = (str(error) if type(error) in (ScheduleError, TradierError)
-                          else "Acquisition/calendar/credentials/preflight failure; details suppressed.")
-            state["last_failure"] = dict(at=now.isoformat(), status=diagnostic + " No report sent.")
+            record.update(retry_after=now.timestamp() + RETRY_SECONDS,
+                          failure_count=record.get("failure_count", 0) + 1)
+            record["last_failure"] = dict(at=now.isoformat(), status=safe_failure(error) + " No report sent.")
+            state["last_failure"] = record["last_failure"]
             save_json(root / "state.json", state)
-            log(root, now, state["last_failure"]["status"], locals().get("slot", {}).get("id"))
+            log(root, now, record["last_failure"]["status"], slot["id"])
+            failure_alert(root, state, record, slot["id"], now)
             return 1
-        state["retry_after"] = 0
-        state["deliveries"][slot["id"]] = dict(slot, status="attempting", attempted=now.isoformat())
+        record.update(status="attempting", attempted=now.isoformat(), retry_after=0)
         save_json(root / "state.json", state)
         try:
             _send_message(app_token, user_key, TITLE, body, monospace=True)
         except Exception:
-            state["deliveries"][slot["id"]]["status"] = "unknown"
+            record["status"] = "unknown"
             save_json(root / "state.json", state)
             log(root, now, "Push rejected or acceptance unknown; operator review required. No automatic retry.", slot["id"])
             return 1
-        state["deliveries"][slot["id"]].update(status="accepted", accepted=datetime.now(timezone.utc).isoformat(),
-                                              characters=len(body), utf8_bytes=len(body.encode("utf-8")))
-        state["last_failure"] = None
+        record.update(status="accepted", accepted=datetime.now(timezone.utc).isoformat(),
+                      characters=len(body), utf8_bytes=len(body.encode("utf-8")))
+        if record.get("last_failure"):
+            record["recovered"] = record["accepted"]
+        # Other blocked slots retain their own diagnostics even after this success.
+        state["last_failure"] = next((item["last_failure"] for item in state["deliveries"].values()
+                                      if item.get("status") == "waiting" and item.get("last_failure")), None)
         save_json(root / "state.json", state)
         log(root, now, "Pushover API accepted; phone receipt not confirmed.", slot["id"])
         return 0
@@ -295,7 +394,7 @@ def main(argv=None):
             return run_once(RUNTIME)
         if args == ["--status"]:
             state = read_state(RUNTIME)
-            print(json.dumps({k: state.get(k) for k in ("activated", "last_check", "last_failure", "deliveries")}, indent=2))
+            print(json.dumps({k: state.get(k) for k in ("activated", "last_check", "last_failure", "retry_after", "retry_scope", "deliveries", "calendar_failures")}, indent=2))
             return 0
         print("Use --status, --run or explicitly authorized --install. No action taken.")
         return 2

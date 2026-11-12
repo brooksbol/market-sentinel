@@ -643,15 +643,50 @@ of the Mac's time zone. Tradier's `/v1/markets/calendar` supplies regular sessio
 complete month responses are validated, historical months cached, and the current
 month refreshed daily. No assumed weekday calendar fills omitted bars.
 
-For a due slot, the worker retrieves 270 calendar days (roughly 185 trading bars)
-for each of the 19 symbols, one history request each. It verifies exact session
-coverage against the cached exchange calendar and requires usable latest K/D and
-adjacent comparisons before sending one complete report. Finite range warnings
-stay visible. It never sends a stale/partial substitute. Data, credential or
-preflight failure is recorded and checked again after 15 minutes; publication at
-16:01 is **not guaranteed**. Appearing after the regular close establishes the
-session cutoff, not that a provider can never revise its bar. Accepted closing
-reports are not resent on later corrections.
+For each due slot, the worker requests **19 contiguous completed exchange sessions**
+through the target session for all 19 symbols, one history request per symbol.
+TA-Lib STOCH(14,3,3), with both smoothing types SMA, has a 17-bar lookback:
+K/D first appear on bar 18; bar 19 supplies the adjacent-session comparison.
+The exchange calendar selects the start date, including holidays. Missing,
+invalid or unexpected in-window bars block the entire report; none are dropped,
+bridged, fabricated or replaced with older evidence. Exact-flat/unavailable
+comparisons still block. Finite price-range warnings remain visible, without
+clamping. Warning totals and historical crossings now describe this recent window.
+
+The scheduled report's authoritative calculation basis is a fresh 19-session
+window, recorded in its evidence JSON. The general historical CLI remains strict
+about its entire explicitly requested range. Scheduled acquisition does not request
+obsolete history; if Tradier nevertheless returns dated rows before the requested
+start, only those rows are excluded before price validation. Their dates and invalid
+OHLC dates are retained as `excluded_old_sessions` and `invalid_old_sessions` in
+report evidence (no raw invalid values). Malformed dates, duplicates, out-of-order
+rows, or unexpected newer rows still fail closed.
+
+**Numerical qualification:** the mathematical SMA dependency is finite, but TA-Lib's
+rolling sums retain start-dependent floating-point roundoff. On installed TA-Lib
+0.8.3, comparing the last two K/D values of 1,000 seeded synthetic 190-bar histories
+with fresh 19-bar calculations gave maximum absolute difference
+`1.9184653865522705e-13`, with zero changed crossings. This is measured evidence,
+not a universal error bound. A constructed exact-20 boundary produced
+`19.999999999999982` with the long history versus `20.0` with the recent window,
+changing that crossing. We explicitly adopt the recent basis, rather than promise
+bitwise historical parity or add a rounding/tolerance rule. The strict full-precision
+`previous K >= 20 and current K < 20` classification remains unchanged. Previously
+accepted reports/evidence are not recomputed or resent. Numerical regression tests
+preserve both the ordinary comparison and this boundary distinction. November 12
+verification also compared the same fresh provider observations for the 14 symbols
+whose full history remained valid: maximum last-two K/D difference was
+`1.5631940186722204e-13`, with no crossing changes. Full-history comparison for the
+other five was unavailable because of the invalid March bars. Comparing fresh data
+against the November 11 retained report showed a larger `0.07657805491755454`
+maximum K/D difference and no crossing changes; the fresh **long** calculation also
+differed from that retained evidence, so that difference cannot be attributed to
+the recent-window policy alone.
+
+Acquisition, validation, credential and preflight failures retain per-slot sanitized
+failure details and retry after 15 minutes. They do not hold up another eligible
+slot. Publication at the scheduled minute is not guaranteed; a provider may revise
+completed-session bars. No stale or partial substitute is sent.
 
 Runtime files are protected (directory 0700, files 0600) outside the checkout:
 
@@ -663,17 +698,42 @@ Runtime files are protected (directory 0700, files 0600) outside the checkout:
   SQLite event/monitoring subsystem.
 - `YYYY-MM-DD-opening.json` / `...-closing.json`: evaluated screening evidence.
 - `worker.log` (bounded, one rotated predecessor) and `launchd.log`: sanitized
-  diagnostics. `last_failure` in status distinguishes delayed/failed acquisition
-  from a quiet successful report; this slice has no independent failure-push service.
+  diagnostics. Per-slot `last_failure`, `last_attempt`, `retry_after`, failure count
+  and recovery time retain acquisition outcomes independently of delivery status.
+  Top-level `last_failure` summarizes unresolved acquisition failures.
 
-A nonblocking file lock prevents overlapping workers. Missed slots since activation
-are recovered chronologically, at most **one report per minute**, without silently
-skipping days. Intent is atomically persisted/fsynced **before** push HTTP; accepted
-slots are never ordinarily resent. A crash during send, timeout, rejection or other
-push failure leaves that slot unknown and **does not automatically retry**. Inspect
-the phone and ledger before separately authorizing manual reconciliation. Subsequent
-slots remain independent. API acceptance never proves phone receipt. Local storage
-failure or missing/locked Keychain can still require operator attention.
+A nonblocking file lock prevents overlapping workers. At most **one eligible report
+acquisition per invocation/minute tick** runs. Never-attempted due slots run before
+retries; otherwise the least recently attempted eligible slot runs first (due time
+breaks ties). An opening failure therefore cannot monopolize the closing slot, even
+when its backoff expires. All missed slots remain eligible for recovery; holidays,
+early closes, schedules and wake/login catch-up are unchanged. Legacy global
+pre-send backoff/failure is attached to its pending slot on upgrade without resetting
+the ledger. Calendar acquisition failure, which prevents verified slot selection,
+retains a shared 15-minute backoff.
+
+**Operational failure alerts (authorized November 12, 2026):** a blocked report sends
+one concise Pushover notification titled `Market Sentinel: report unavailable`,
+identifying the slot and sanitized cause. It is not a market report. Each slot's
+`failure_alert` is persisted in the existing ledger, suppressing repeats across
+retries, reason changes and restarts. Shared calendar failures have one alert identity
+per Eastern date, listing unresolved slots from cached calendar evidence when possible;
+otherwise the notification explicitly says the calendar is unavailable. Credential or
+preflight failure before alert intent can retry with the next 15-minute acquisition
+retry. If credentials/transport are unavailable, phone failure reporting is necessarily
+unavailable too; protected status/logs remain the diagnostic source.
+
+For both market reports and operational alerts, intent is atomically persisted/fsynced
+**before** push HTTP. Acceptance is recorded separately. Accepted sends are never
+ordinarily resent. A crash during send, timeout, rejection or other send exception
+leaves acceptance unknown and **does not automatically retry that notification**.
+Interrupted intents become unknown on recovery. Inspect the phone and ledger before
+separately authorizing manual reconciliation. Unknown failure-alert delivery does not
+stop market-data retries or a later recovered report. A successfully accepted report
+records recovery while preserving its failure history; the report itself serves as
+the recovery notification, without another recovery push. Subsequent report slots
+remain independent. API acceptance never proves phone receipt. Local storage failure
+or missing/locked Keychain can still require operator attention.
 
 Inspect operation (no notifications sent by `--status`):
 
@@ -693,8 +753,8 @@ Installation refuses to overwrite an existing ledger or LaunchAgent. It creates
 checkout's absolute virtual-environment Python and working directory; no secrets
 are in the plist. Keep the checkout/venv at that location. The worker uses the
 existing protected Keychain credentials, with no account/order endpoints or new
-credentials. It sends only scheduled universe reports, with unchanged Pushover
-settings. To stop, preserving the ledger:
+credentials. It sends scheduled universe reports and bounded operational failure alerts, using
+the existing Pushover transport. To stop, preserving the ledger:
 
 ```sh
 launchctl bootout gui/$(id -u)/com.market-sentinel.daily-reports
@@ -703,7 +763,7 @@ launchctl bootout gui/$(id -u)/com.market-sentinel.daily-reports
 To resume the preserved installation, use `launchctl bootstrap gui/$(id -u)` with
 the existing plist path (rather than `--install`). A future cloud deployment and
 SQLite/event deduplication remain separate decisions. Offline tests cover calendar
-validation, holiday/early-close/DST boundaries, chronological replay, full coverage,
+validation, holiday/early-close/DST boundaries, independent catch-up, full coverage,
 stale-data delay, accepted/ambiguous sends, intent-before-HTTP, locking and secret
 redaction. [Tradier calendar](https://docs.tradier.com/market-data/get-market-calendar)
 and the installed macOS `launchd.plist(5)` wake semantics were verified November 2,
