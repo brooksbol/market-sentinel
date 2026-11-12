@@ -659,8 +659,10 @@ about its entire explicitly requested range. Scheduled acquisition does not requ
 obsolete history; if Tradier nevertheless returns dated rows before the requested
 start, only those rows are excluded before price validation. Their dates and invalid
 OHLC dates are retained as `excluded_old_sessions` and `invalid_old_sessions` in
-report evidence (no raw invalid values). Malformed dates, duplicates, out-of-order
-rows, or unexpected newer rows still fail closed.
+report evidence (no raw invalid values). Rows whose dates cannot establish their scope still fail closed, as do duplicate
+or out-of-order in-window rows and unexpected newer rows. Proven older rows cannot
+block the calculation even if duplicated or out of order; response size bounds
+still apply.
 
 **Numerical qualification:** the mathematical SMA dependency is finite, but TA-Lib's
 rolling sums retain start-dependent floating-point roundoff. On installed TA-Lib

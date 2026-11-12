@@ -46,6 +46,20 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertEqual(get.call_args.kwargs["start"], date.fromisoformat(rows[-19]["date"]))
         self.assertNotIn('"NaN"', json.dumps(report, allow_nan=False))
 
+    def test_proven_old_rows_cannot_block_on_order_duplicates_or_weekends(self):
+        cutoff, days, rows = recent_fixture()
+        old = dict(date="2026-03-19", open="NaN", high="NaN", low="NaN", close=106.62)
+        # Unrequested old rows may arrive anywhere; only the required window is ordered.
+        rows.insert(-1, old)
+        rows.insert(0, dict(old, date="2026-03-21"))
+        rows.insert(0, copy.deepcopy(old))
+        result, _ = self.acquire(rows, days, cutoff)
+        self.assertEqual(result["results"][0]["invalid_old_sessions"].count("2026-03-19"), 2)
+        self.assertEqual(result["results"][0]["valid_bars"], 19)
+        rows.insert(0, dict(old, date="not-a-date"))
+        with self.assertRaises(worker.ScheduleError):
+            self.acquire(rows, days, cutoff)
+
     def test_invalid_missing_duplicate_or_out_of_order_recent_bars_fail(self):
         cutoff, days, rows = recent_fixture()
         for fault in ("invalid", "missing", "duplicate", "reordered", "future"):

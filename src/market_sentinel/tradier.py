@@ -82,14 +82,14 @@ def _dates(start, end, completed_through):
         raise TradierError("Use an ordered history range of at most 366 days and a valid cutoff.")
 
 
-def _session(value):
+def _session(value, *, allow_weekend=False):
     if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
         raise TradierError("Invalid historical session date.")
     try:
         session = date.fromisoformat(value)
     except ValueError:
         raise TradierError("Invalid historical session date.") from None
-    if session.weekday() >= 5:
+    if session.weekday() >= 5 and not allow_weekend:
         raise TradierError("Unexpected weekend equity session; calendar coverage is unverified.")
     return session
 
@@ -122,13 +122,7 @@ def normalize_history(payload, *, symbol, environment, start, end, completed_thr
     for row in rows:
         if not isinstance(row, dict):
             raise TradierError("Malformed daily history observation.")
-        session = _session(row.get("date"))
-        if session in seen:
-            raise TradierError("Duplicate historical session; no indicator calculated.")
-        if previous is not None and session <= previous:
-            raise TradierError("Historical sessions must be strictly increasing; no sorting performed.")
-        seen.add(session)
-        previous = session
+        session = _session(row.get("date"), allow_weekend=exclude_older)
         if exclude_older and session < start:
             excluded_old.append(session)
             try:
@@ -136,6 +130,14 @@ def normalize_history(payload, *, symbol, environment, start, end, completed_thr
             except (KeyError, ValueError, TypeError, OverflowError):
                 invalid_old.append(session)
             continue
+        if session.weekday() >= 5:
+            raise TradierError("Unexpected weekend equity session; calendar coverage is unverified.")
+        if session in seen:
+            raise TradierError("Duplicate historical session; no indicator calculated.")
+        if previous is not None and session <= previous:
+            raise TradierError("Historical sessions must be strictly increasing; no sorting performed.")
+        seen.add(session)
+        previous = session
         if not start <= session <= end:
             raise TradierError("Historical session outside requested range.")
         try:
