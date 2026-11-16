@@ -14,7 +14,7 @@ TITLE = "Market Sentinel — Daily Report"
 
 
 class ReportError(ValueError):
-    """Sanitized report preflight failure. Never send a partial substitute."""
+    """Sanitized report preflight failure; never silently omit a symbol."""
 
 
 def _require(condition, message):
@@ -57,7 +57,7 @@ def stochastic_state(k):
     return "Oversold" if k < 20 else "Overbought" if k > 80 else "Neutral"
 
 
-def format_daily_report(screening, *, demonstration=False):
+def format_daily_report(screening, *, demonstration=False, compact=False):
     """Return all 19 rows or ReportError; never mutate or repair source results.
 
     Rows with available K sort by full-precision K then symbol. Explicit upstream
@@ -158,6 +158,19 @@ def format_daily_report(screening, *, demonstration=False):
         lines.append("Not a live scheduled result. Manual review.")
     else:
         lines.append("Informational screening. Manual review.")
+    if compact:
+        def numeric(value, decimals):
+            if value is None: return "--"
+            fixed = f"{value:.{decimals}f}"
+            return fixed if len(fixed) <= 9 else f"{value:.2e}"
+        lines = [f"{session} | {usable_count}/19 available", "SYM CLOSE STOCH STATE"]
+        for symbol, close, k, _ in rows:
+            lines.append(f"{symbol:<4} {numeric(close, 2)} {numeric(k, 0)} {stochastic_state(k)}")
+        lines += [f"Crossings: {crossings} known; {len(SYMBOLS)-usable_count} unavailable",
+                  f"Oversold: {oversold} | Overbought: {overbought} (available only)",
+                  f"Warnings: {warning_count} sample; {session_warnings} on session",
+                  "Not a live scheduled result. Manual review." if demonstration else "Informational screening. Manual review."]
+        if demonstration: lines.insert(0, "DEMONSTRATION - previously verified data")
     body = "\n".join(lines)
     try:
         validate_message(TITLE + (" TEST" if demonstration else ""), body)

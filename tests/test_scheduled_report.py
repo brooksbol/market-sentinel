@@ -136,8 +136,10 @@ class AcquisitionTests(unittest.TestCase):
         self.assertEqual(report["results"][0]["latest"]["k"], 50)
         self.assertEqual(report["results"][0]["latest"]["d"], 50)
         rows.pop()  # A stale close cannot silently become a successful report.
-        with patch.object(worker, "fetch_history", side_effect=fetch), self.assertRaisesRegex(worker.ScheduleError, "Missing, stale"):
-            worker.acquire_screening("synthetic", cutoff, days)
+        with patch.object(worker, "fetch_history", side_effect=fetch):
+            unavailable = worker.acquire_screening("synthetic", cutoff, days)
+        self.assertEqual(unavailable["summary"]["usable_latest_symbols"], 0)
+        self.assertIn("Missing, stale", unavailable["results"][0]["error"])
 
     def test_context_and_character_preflight(self):
         slot = dict(kind="opening", observation="2026-11-02", session="2026-10-30")

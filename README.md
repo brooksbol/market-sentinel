@@ -648,10 +648,10 @@ through the target session for all 19 symbols, one history request per symbol.
 TA-Lib STOCH(14,3,3), with both smoothing types SMA, has a 17-bar lookback:
 K/D first appear on bar 18; bar 19 supplies the adjacent-session comparison.
 The exchange calendar selects the start date, including holidays. Missing,
-invalid or unexpected in-window bars block the entire report; none are dropped,
+invalid or unexpected in-window bars make that symbol unavailable; none are dropped,
 bridged, fabricated or replaced with older evidence. Exact-flat/unavailable
-comparisons still block. Finite price-range warnings remain visible, without
-clamping. Warning totals and historical crossings now describe this recent window.
+comparisons also make only that symbol unavailable. Finite price-range warnings
+remain visible, without clamping. Warning totals and historical crossings now describe this recent window.
 
 The scheduled report's authoritative calculation basis is a fresh 19-session
 window, recorded in its evidence JSON. The general historical CLI remains strict
@@ -659,7 +659,8 @@ about its entire explicitly requested range. Scheduled acquisition does not requ
 obsolete history; if Tradier nevertheless returns dated rows before the requested
 start, only those rows are excluded before price validation. Their dates and invalid
 OHLC dates are retained as `excluded_old_sessions` and `invalid_old_sessions` in
-report evidence (no raw invalid values). Rows whose dates cannot establish their scope still fail closed, as do duplicate
+report evidence (no raw invalid values). Rows whose dates cannot establish their
+scope still fail closed, as do duplicate
 or out-of-order in-window rows and unexpected newer rows. Proven older rows cannot
 block the calculation even if duplicated or out of order; response size bounds
 still apply.
@@ -685,10 +686,36 @@ maximum K/D difference and no crossing changes; the fresh **long** calculation a
 differed from that retained evidence, so that difference cannot be attributed to
 the recent-window policy alone.
 
-Acquisition, validation, credential and preflight failures retain per-slot sanitized
-failure details and retry after 15 minutes. They do not hold up another eligible
-slot. Publication at the scheduled minute is not guaranteed; a provider may revise
-completed-session bars. No stale or partial substitute is sent.
+**Symbol isolation (November 16, 2026):** every scheduled snapshot includes all 19
+configured symbols. Individual acquisition, validation and calculation failures are
+retained as sanitized unavailable rows; successful peers are still delivered.
+Authentication/entitlement and quota errors stop unnecessary requests; unrequested
+symbols are explicitly named, while already verified results remain available.
+Coverage (for example `18/19 available`) and known crossing counts are separate from
+unavailable evaluations. Zero known crossings with missing evaluations does not mean
+no signal. Compact scheduled text preserves K ordering, closing prices, states,
+warning counts and every symbol within Pushover's 1,024-character limit. Very wide
+numbers use scientific display notation, with classification and sorting based on
+full precision. All-symbol failure sends one `0/19 available` report with unavailable
+rows, reason categories and recovery status, rather than only an error alert.
+Detailed sanitized symbol reasons and acquisition timestamps remain in report JSON.
+
+**Bounded recovery:** per-slot progress retains verified results for exactly the
+same slot and completed session. Only unresolved symbols are fetched after each
+15-minute backoff; new successes are retained even if another symbol still fails.
+The initial snapshot is immutable. An accepted partial/unavailable report starts a
+separate `<slot>:recovery` delivery identity in the ledger. Incomplete recovery updates
+status/progress silently; when every symbol is verified, at most one `UPDATE Opening`
+or `UPDATE Closing` notification identifies the original observation date. Retained
+successes are not refreshed, so per-symbol acquisition timestamps can differ; no
+other session's data is reused. Before a newer report of the same type runs, any
+older waiting recovery expires with a recorded reason. Closing does not expire
+opening recovery. Unknown sends remain unknown and require explicit reconciliation;
+they do not start an automatic recovery notification chain.
+
+Publication at the scheduled minute is not guaranteed: bounded sequential network
+requests/timeouts take time, sleep delays checks, and a provider may revise completed
+bars. Missing data never become stale or fabricated values.
 
 Runtime files are protected (directory 0700, files 0600) outside the checkout:
 
@@ -698,7 +725,12 @@ Runtime files are protected (directory 0700, files 0600) outside the checkout:
   intent/acceptance. **Preserve this file**; deleting/resetting it can duplicate
   reports or lose recovery history. This small report ledger is not the planned
   SQLite event/monitoring subsystem.
-- `YYYY-MM-DD-opening.json` / `...-closing.json`: evaluated screening evidence.
+- `YYYY-MM-DD-opening.json` / `...-closing.json`: initial screening evidence.
+- `...-progress.json`: atomically updated same-slot recovery progress; successfully
+  evaluated symbol rows are retained unchanged. `...-recovery.json`: immutable full
+  recovery evidence. A timestamp suffix preserves any already-existing snapshot;
+  each delivery entry's `evidence_file` records the exact file used. No old report
+  files or ledger entries are overwritten/reset by installation.
 - `worker.log` (bounded, one rotated predecessor) and `launchd.log`: sanitized
   diagnostics. Per-slot `last_failure`, `last_attempt`, `retry_after`, failure count
   and recovery time retain acquisition outcomes independently of delivery status.
@@ -714,16 +746,21 @@ pre-send backoff/failure is attached to its pending slot on upgrade without rese
 the ledger. Calendar acquisition failure, which prevents verified slot selection,
 retains a shared 15-minute backoff.
 
-**Operational failure alerts (authorized November 12, 2026):** a blocked report sends
-one concise Pushover notification titled `Market Sentinel: report unavailable`,
-identifying the slot and sanitized cause. It is not a market report. Each slot's
-`failure_alert` is persisted in the existing ledger, suppressing repeats across
-retries, reason changes and restarts. Shared calendar failures have one alert identity
-per Eastern date, listing unresolved slots from cached calendar evidence when possible;
-otherwise the notification explicitly says the calendar is unavailable. Credential or
-preflight failure before alert intent can retry with the next 15-minute acquisition
-retry. If credentials/transport are unavailable, phone failure reporting is necessarily
-unavailable too; protected status/logs remain the diagnostic source.
+**One notification experience:** symbol failures produce the partial or unavailable
+market report, with no redundant `report unavailable` alert for that attempt.
+Operational alerts remain for failures that prevent constructing/delivering a report
+at all (for example calendar selection or preflight/persistence failures). Accepted
+partial reports do not generate further operational pushes during recovery; genuine
+recovery failures remain in protected status/logs. Existing alert identities remain
+intact across upgrade. Calendar failures have one alert identity per Eastern date;
+other pre-report failures have one per slot. Credentials must be available for any
+phone notification; protected status/logs remain available when push reporting fails.
+
+The existing version-1 ledger accepts additive recovery metadata. Legacy accepted
+or uncertain slots without a recovery identity are terminal: upgrade does not replay
+them or infer recovery from an old failure alert. Legacy pending slots may deliver a
+new partial snapshot without repeating their earlier failure alert. No reset or
+scheduler reinstallation is used.
 
 For both market reports and operational alerts, intent is atomically persisted/fsynced
 **before** push HTTP. Acceptance is recorded separately. Accepted sends are never
@@ -731,9 +768,10 @@ ordinarily resent. A crash during send, timeout, rejection or other send excepti
 leaves acceptance unknown and **does not automatically retry that notification**.
 Interrupted intents become unknown on recovery. Inspect the phone and ledger before
 separately authorizing manual reconciliation. Unknown failure-alert delivery does not
-stop market-data retries or a later recovered report. A successfully accepted report
-records recovery while preserving its failure history; the report itself serves as
-the recovery notification, without another recovery push. Subsequent report slots
+stop market-data retries or a later recovered report. A successfully accepted full
+initial report or recovery update
+records recovery while preserving its failure history. Original and recovery-update
+acceptance remain separate; neither proves phone receipt. Subsequent report slots
 remain independent. API acceptance never proves phone receipt. Local storage failure
 or missing/locked Keychain can still require operator attention.
 

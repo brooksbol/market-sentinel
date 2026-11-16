@@ -92,45 +92,95 @@ def due_reports(now, activated, sessions):
     return due
 
 
-def acquire_screening(token, cutoff, sessions):
-    """One GET per symbol; require exact exchange-calendar coverage before sending."""
-    expected = tuple(date.fromisoformat(day) for day, hours in sorted(sessions.items())
-                     if hours is not None and day <= str(cutoff))[-HISTORY_SESSIONS:]
-    if len(expected) != HISTORY_SESSIONS or expected[-1] != cutoff:
-        raise ScheduleError("Insufficient verified historical calendar coverage.")
-    start = expected[0]
-    if any(str(start + timedelta(days=n)) not in sessions for n in range((cutoff-start).days+1)):
-        raise ScheduleError("Incomplete recent exchange calendar; report delayed.")
-    results = []
-    for symbol in SYMBOLS:
-        try:
-            history = fetch_history(token, symbol=symbol, environment="production", start=start,
-                                    end=cutoff, completed_through=cutoff, exclude_older=True)
-        except TradierError as error:
-            raise ScheduleError(symbol + ": " + str(error)) from None
-        if tuple(bar.session for bar in history.bars) != expected:
-            raise ScheduleError("Missing, stale or unexpected daily bars for " + symbol + "; report delayed.")
-        report = history_report(history)
-        report["continuity"] = "Verified against Tradier regular-session calendar"
-        if report["status"] not in ("calculated", "calculated_with_warnings"):
-            raise ScheduleError("Unavailable indicator/comparison for " + symbol + "; report delayed.")
-        results.append(report)
-    warnings = sum(row["warning_count"] for row in results)
+def screening_result(cutoff, results):
+    valid = [row for row in results if row["status"] in ("calculated", "calculated_with_warnings")]
+    warnings = sum(row["warning_count"] for row in valid)
     return dict(label=LABEL, notice=NOTICE, evidence_timestamp=datetime.now(timezone.utc).isoformat(),
                 calculation_policy=dict(completed_exchange_sessions=HISTORY_SESSIONS,
                                         basis="Recent contiguous sessions; TA-Lib STOCH(14,3,3) SMA"),
                 summary=dict(provider="Tradier", environment="production", completed_session=str(cutoff),
-                             configured_symbols=19, acquired_symbols=19, evaluated_symbols=19, usable_latest_symbols=19,
-                             new_downward_crossings=sum(row["latest"]["crossed_below_20"] for row in results),
-                             warning_count=warnings, status="complete_with_warnings" if warnings else "complete"),
-                results=results)
+                             configured_symbols=len(SYMBOLS), acquired_symbols=len(valid),
+                             evaluated_symbols=len(valid), usable_latest_symbols=len(valid),
+                             new_downward_crossings=sum(row["latest"]["crossed_below_20"] for row in valid),
+                             warning_count=warnings, status="incomplete" if len(valid) != len(SYMBOLS)
+                             else "complete_with_warnings" if warnings else "complete"), results=results)
 
 
-def notification_body(screening, slot):
-    """Add observation context; report itself labels the completed data session."""
+def failed_symbol(symbol, error, *, attempted=True):
+    reason = safe_failure(error)
+    kind = ("quota" if "rate limit" in reason or "quota" in reason.lower() else
+            "access" if "authentication" in reason or "entitlement" in reason or "credentials" in reason else
+            "network" if "network" in reason or "timeout" in reason else
+            "history" if type(error) in (ScheduleError, TradierError) else "calculation")
+    return dict(symbol=symbol, status="failed" if attempted else "not attempted after access/quota failure",
+                error=reason, failure_kind=kind, attempted=attempted,
+                evidence_timestamp=datetime.now(timezone.utc).isoformat())
+
+
+def acquire_screening(token, cutoff, sessions, previous=None):
+    """Retain verified same-slot observations; fetch only unresolved symbols.
+
+    One symbol cannot abort its peers. Access/quota failures stop further requests.
+    The caller validates the persisted snapshot identity before supplying previous.
+    """
+    cached = {row["symbol"]: row for row in previous["results"]} if previous else {}
+    expected = tuple(date.fromisoformat(day) for day, hours in sorted(sessions.items())
+                     if hours is not None and day <= str(cutoff))[-HISTORY_SESSIONS:]
+    context_error = None
+    if len(expected) != HISTORY_SESSIONS or expected[-1] != cutoff:
+        context_error = ScheduleError("Insufficient verified historical calendar coverage.")
+    elif any(str(expected[0]+timedelta(days=n)) not in sessions for n in range((cutoff-expected[0]).days+1)):
+        context_error = ScheduleError("Incomplete recent exchange calendar.")
+    results, stopped = [], None
+    for symbol in SYMBOLS:
+        prior = cached.get(symbol)
+        if prior and prior["status"] in ("calculated", "calculated_with_warnings"):
+            results.append(prior)
+            continue
+        if stopped is not None:
+            results.append(failed_symbol(symbol, stopped, attempted=False))
+            continue
+        try:
+            if context_error: raise context_error
+            if isinstance(token, Exception): raise token
+            history = fetch_history(token, symbol=symbol, environment="production", start=expected[0],
+                                    end=cutoff, completed_through=cutoff, exclude_older=True)
+            if tuple(bar.session for bar in history.bars) != expected:
+                raise ScheduleError("Missing, stale or unexpected daily bars; symbol unavailable.")
+            report = history_report(history)
+            report["continuity"] = "Verified against Tradier regular-session calendar"
+            if report["status"] not in ("calculated", "calculated_with_warnings"):
+                raise ScheduleError("Unavailable indicator/comparison; symbol unavailable.")
+            if report.get("symbol") != symbol:
+                raise ScheduleError("Calculated symbol identity mismatch.")
+            check = [report] + [dict(symbol=other, status="failed") for other in SYMBOLS if other != symbol]
+            format_daily_report(screening_result(cutoff, check), compact=True)
+            report["evidence_timestamp"] = datetime.now(timezone.utc).isoformat()
+            results.append(report)
+        except Exception as error:
+            results.append(failed_symbol(symbol, error, attempted=not isinstance(token, Exception)))
+            if (isinstance(error, TradierError) and error.stop_batch) or isinstance(token, Exception):
+                stopped = error
+    return screening_result(cutoff, results)
+
+
+def notification_body(screening, slot, *, recovery=False):
+    """One all-symbol snapshot; unknown evaluations never count as no signal."""
     if screening.get("summary", {}).get("completed_session") != slot["session"]:
         raise ScheduleError("Report session does not match the scheduled completed-session target.")
-    body = f"{slot['kind'].capitalize()} {slot['observation']} ET\n" + format_daily_report(screening)
+    prefix = "UPDATE " if recovery else ""
+    body = f"{prefix}{slot['kind'].capitalize()} {slot['observation']} ET\n" + format_daily_report(screening, compact=True)
+    if screening["summary"]["usable_latest_symbols"] < len(SYMBOLS):
+        kinds = sorted({row.get("failure_kind", "unavailable") for row in screening["results"] if "latest" not in row})
+        body += "\nReasons: " + ",".join(kinds)
+        if screening["summary"]["usable_latest_symbols"] == 0:
+            first = screening["results"][0]
+            body += "\nFirst failure: " + first["symbol"] + ": " + first.get("error", "Unavailable")[:110]
+        unattempted = [row["symbol"] for row in screening["results"] if row.get("attempted") is False]
+        if unattempted: body += "\nNot requested: " + ",".join(unattempted)
+        body += "\nRecovery: retry missing in 15m; one full update."
+    elif recovery:
+        body += "\nRecovery complete for original slot."
     validate_message(TITLE, body)
     return body
 
@@ -165,6 +215,12 @@ def read_state(root):
     for item in state["deliveries"].values():
         if item.get("status") not in ("accepted", "attempting", "unknown", "waiting"):
             raise ScheduleError("Invalid delivery status; operator inspection required.")
+    for identity, item in state["deliveries"].items():
+        if "recovery" in item:
+            recovery = item["recovery"]
+            if (not isinstance(recovery, dict) or recovery.get("id") != identity + ":recovery" or
+                    recovery.get("status") not in ("waiting", "attempting", "accepted", "unknown", "expired")):
+                raise ScheduleError("Invalid recovery ledger; operator inspection required.")
     if not isinstance(state.get("calendar_failures", {}), dict):
         raise ScheduleError("Invalid calendar failure ledger; operator inspection required.")
     for item in list(state["deliveries"].values()) + list(state.get("calendar_failures", {}).values()):
@@ -229,6 +285,51 @@ def failure_alert(root, state, record, identity, now):
     save_json(root / "state.json", state)
 
 
+def progress_path(root, slot):
+    return root / (slot["id"].replace(":", "-") + "-progress.json")
+
+
+def read_progress(root, slot):
+    path = progress_path(root, slot)
+    if not path.exists(): return None
+    report = json.loads(path.read_text())
+    if report.get("slot_id") != slot["id"] or report.get("summary", {}).get("completed_session") != slot["session"]:
+        raise ScheduleError("Progress evidence does not match this slot/session; operator inspection required.")
+    format_daily_report(report, compact=True)  # Validate every retained row before reuse.
+    return report
+
+
+def retain_snapshot(root, slot, report, *, recovery=False):
+    name = slot["id"].replace(":", "-") + ("-recovery" if recovery else "")
+    path = root / (name + ".json")
+    if path.exists() and json.loads(path.read_text()) != report:
+        # Previously retained evidence, including pre-upgrade evidence, is immutable.
+        path = root / (name + "-" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%f") + ".json")
+    if not path.exists(): save_json(path, report)
+    return path.name
+
+
+def unresolved(report):
+    return [row["symbol"] for row in report["results"] if row["status"] not in ("calculated", "calculated_with_warnings")]
+
+
+def task_entry(state, slot):
+    record = state["deliveries"].get(slot["id"], {})
+    return record.get("recovery", {}) if slot.get("recovery_update") else record
+
+
+def current_failure(state):
+    failures = []
+    for item in state["deliveries"].values():
+        if item.get("status") == "waiting" and item.get("last_failure"):
+            failures.append(item["last_failure"])
+        recovery = item.get("recovery", {})
+        if recovery.get("status") == "waiting":
+            failure = recovery.get("last_failure", item.get("last_failure"))
+            if failure: failures.append(failure)
+    return max(failures, key=lambda item: datetime.fromisoformat(item["at"]).timestamp()) if failures else None
+
+
 def run_once(root, now=None):
     """One eligible acquisition per tick; failed slots have independent backoff.
 
@@ -245,13 +346,17 @@ def run_once(root, now=None):
         state = read_state(root)
         interrupted = False
         for record in list(state["deliveries"].values()) + list(state.get("calendar_failures", {}).values()):
+            for intent in (record, record.get("recovery", {})):
+                if intent.get("status") == "attempting":
+                    intent["status"] = "unknown"
+                    interrupted = True
             alert = record.get("failure_alert", {})
             if alert.get("status") == "attempting":
                 alert["status"] = "unknown"
                 interrupted = True
         if interrupted:
             save_json(root / "state.json", state)
-            log(root, now, "Previous operational alert interrupted; acceptance unknown. No automatic retry.")
+            log(root, now, "Previous notification intent interrupted; acceptance unknown. No automatic retry.")
         if state.get("retry_scope") == "calendar" and now.timestamp() < state.get("retry_after", 0):
             return 0
         try:
@@ -290,38 +395,75 @@ def run_once(root, now=None):
             failure_alert(root, state, record, ", ".join(identities)[:200] or "scheduled slots (calendar unavailable)", now)
             return 1
         pending = []
+        newest = {kind: max((slot["observation"] for slot in due if slot["kind"] == kind), default="")
+                  for kind in ("opening", "closing")}
         for slot in due:
             delivered = state["deliveries"].get(slot["id"], {})
-            if delivered.get("status") == "attempting":
-                delivered["status"] = "unknown"
-                log(root, now, "Previous send interrupted; acceptance unknown. No automatic retry.", slot["id"])
-            if delivered.get("status") in ("accepted", "unknown"):
-                continue
-            pending.append(slot)
-        # Preserve a legacy pre-send failure/backoff, but attach it to its slot.
+            recovery = delivered.get("recovery", {})
+            if recovery.get("status") == "waiting" and slot["observation"] < newest[slot["kind"]]:
+                recovery.update(status="expired", expired=now.isoformat(),
+                                reason="Newer " + slot["kind"] + " report is due; old recovery suppressed.")
+                log(root, now, recovery["reason"], recovery["id"])
+            if delivered.get("status") == "accepted":
+                if recovery.get("status") == "waiting":
+                    pending.append(dict(slot, recovery_update=True))
+            elif delivered.get("status") != "unknown":
+                pending.append(slot)
+        # Preserve a legacy pre-send failure/backoff without replaying any send.
         if pending and state.get("retry_scope") != "calendar" and state.get("retry_after", 0):
-            record = state["deliveries"].setdefault(pending[0]["id"], dict(pending[0], status="waiting"))
+            first = pending[0]
+            record = state["deliveries"].setdefault(first["id"], dict(first, status="waiting"))
             record.setdefault("retry_after", state["retry_after"])
             if state.get("last_failure"):
                 record.setdefault("last_failure", state["last_failure"])
                 record.setdefault("last_attempt", state["last_failure"]["at"])
-        state.update(retry_after=0, retry_scope="calendar")
-        state["last_check"] = now.isoformat()
-        eligible = [slot for slot in pending if now.timestamp() >= state["deliveries"].get(slot["id"], {}).get("retry_after", 0)]
+        state.update(retry_after=0, retry_scope="calendar", last_check=now.isoformat())
+        state["last_failure"] = current_failure(state)
+        eligible = [slot for slot in pending if now.timestamp() >= task_entry(state, slot).get("retry_after", 0)]
         if not eligible:
             save_json(root / "state.json", state)
             return 0
         def priority(item):
-            attempted = state["deliveries"].get(item["id"], {}).get("last_attempt")
+            attempted = task_entry(state, item).get("last_attempt")
             return (datetime.fromisoformat(attempted).timestamp() if attempted else float("-inf"), item["due"])
         slot = min(eligible, key=priority)
-        record = state["deliveries"].setdefault(slot["id"], dict(slot, status="waiting"))
+        parent = state["deliveries"].setdefault(slot["id"], dict(slot, status="waiting"))
+        recovering = bool(slot.get("recovery_update"))
+        record = parent["recovery"] if recovering else parent
         record["last_attempt"] = now.isoformat()
+        identity = record.get("id", slot["id"])
         try:
-            token = token or load_token("production")
-            screening = acquire_screening(token, date.fromisoformat(slot["session"]), sessions)
-            body = notification_body(screening, slot)
-            save_json(root / (slot["id"].replace(":", "-") + ".json"), screening)
+            previous = read_progress(root, slot)
+            if recovering and previous is None:
+                raise ScheduleError("Recovery progress evidence missing; retained results cannot be substituted.")
+            if previous and not unresolved(previous):
+                screening = previous
+            else:
+                try:
+                    token = token or load_token("production")
+                except Exception:
+                    token = TradierError("Market-data credentials unavailable; no history requested.", stop_batch=True)
+                if previous is None:
+                    screening = acquire_screening(token, date.fromisoformat(slot["session"]), sessions)
+                else:
+                    screening = acquire_screening(token, date.fromisoformat(slot["session"]), sessions, previous=previous)
+            screening["slot_id"] = slot["id"]
+            body = notification_body(screening, slot, recovery=recovering)
+            missing = unresolved(screening)
+            record["unresolved_symbols"] = missing
+            save_json(progress_path(root, slot), screening)
+            if missing:
+                reason = "; ".join(row["symbol"] + ": " + row.get("error", "Unavailable")
+                                   for row in screening["results"] if row["symbol"] in missing)
+                record["last_failure"] = dict(at=now.isoformat(), status=reason)
+                state["last_failure"] = record["last_failure"]
+                log(root, now, f"{len(SYMBOLS)-len(missing)}/19 available; " + reason, identity)
+            if recovering and missing:
+                record.update(retry_after=now.timestamp() + RETRY_SECONDS,
+                              failure_count=record.get("failure_count", 0) + 1)
+                save_json(root / "state.json", state)
+                return 0  # Retained progress, not another partial push or failure alert.
+            record["evidence_file"] = retain_snapshot(root, slot, screening, recovery=recovering)
             app_token, user_key = load_credentials()
         except Exception as error:
             record.update(retry_after=now.timestamp() + RETRY_SECONDS,
@@ -329,27 +471,32 @@ def run_once(root, now=None):
             record["last_failure"] = dict(at=now.isoformat(), status=safe_failure(error) + " No report sent.")
             state["last_failure"] = record["last_failure"]
             save_json(root / "state.json", state)
-            log(root, now, record["last_failure"]["status"], slot["id"])
-            failure_alert(root, state, record, slot["id"], now)
+            log(root, now, record["last_failure"]["status"], identity)
+            # No redundant operational alert for symbol failures or accepted partials.
+            if not recovering: failure_alert(root, state, record, identity, now)
             return 1
-        record.update(status="attempting", attempted=now.isoformat(), retry_after=0)
+        record.update(status="attempting", attempted=now.isoformat(), retry_after=0,
+                      available_symbols=len(SYMBOLS)-len(missing))
         save_json(root / "state.json", state)
         try:
             _send_message(app_token, user_key, TITLE, body, monospace=True)
         except Exception:
             record["status"] = "unknown"
             save_json(root / "state.json", state)
-            log(root, now, "Push rejected or acceptance unknown; operator review required. No automatic retry.", slot["id"])
+            log(root, now, "Push rejected or acceptance unknown; operator review required. No automatic retry.", identity)
             return 1
         record.update(status="accepted", accepted=datetime.now(timezone.utc).isoformat(),
                       characters=len(body), utf8_bytes=len(body.encode("utf-8")))
-        if record.get("last_failure"):
+        if not recovering and missing:
+            record["recovery"] = dict(id=slot["id"] + ":recovery", status="waiting",
+                                      retry_after=now.timestamp()+RETRY_SECONDS,
+                                      last_attempt=now.isoformat(), unresolved_symbols=missing)
+        elif recovering or record.get("last_failure"):
             record["recovered"] = record["accepted"]
-        # Other blocked slots retain their own diagnostics even after this success.
-        state["last_failure"] = next((item["last_failure"] for item in state["deliveries"].values()
-                                      if item.get("status") == "waiting" and item.get("last_failure")), None)
+        state["last_failure"] = current_failure(state)
         save_json(root / "state.json", state)
-        log(root, now, "Pushover API accepted; phone receipt not confirmed.", slot["id"])
+        log(root, now, ("Recovery update" if recovering else "Market report") +
+            f" {len(SYMBOLS)-len(missing)}/19 API accepted; phone receipt not confirmed.", identity)
         return 0
 
 

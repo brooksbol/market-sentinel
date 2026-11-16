@@ -214,7 +214,7 @@ def _get_json(token, environment, endpoint, parameters):
         if status in (401, 403):
             raise TradierError("Tradier authentication/entitlement rejected; check environment and token.", stop_batch=True) from None
         if status == 429 or (status == 400 and b"Quota Violation" in raw):
-            raise TradierError("Tradier rate limit reached; no automatic retry.", stop_batch=True) from None
+            raise TradierError("Tradier rate limit reached; defer further history requests.", stop_batch=True) from None
         raise TradierError("Tradier HTTP failure; history not verified.") from None
     except (OSError, URLError, HTTPException):
         raise TradierError("Tradier network/TLS failure or timeout; history not verified.") from None

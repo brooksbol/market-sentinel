@@ -57,8 +57,9 @@ class RecentHistoryTests(unittest.TestCase):
         self.assertEqual(result["results"][0]["invalid_old_sessions"].count("2026-03-19"), 2)
         self.assertEqual(result["results"][0]["valid_bars"], 19)
         rows.insert(0, dict(old, date="not-a-date"))
-        with self.assertRaises(worker.ScheduleError):
-            self.acquire(rows, days, cutoff)
+        result, _ = self.acquire(rows, days, cutoff)
+        self.assertEqual(result["summary"]["usable_latest_symbols"], 0)
+        self.assertTrue(all("latest" not in row for row in result["results"]))
 
     def test_invalid_missing_duplicate_or_out_of_order_recent_bars_fail(self):
         cutoff, days, rows = recent_fixture()
@@ -69,8 +70,10 @@ class RecentHistoryTests(unittest.TestCase):
             if fault == "duplicate": damaged.insert(-1, copy.deepcopy(damaged[-2]))
             if fault == "reordered": damaged[-2], damaged[-3] = damaged[-3], damaged[-2]
             if fault == "future": damaged.append(dict(damaged[-1], date="2026-11-12"))
-            with self.subTest(fault=fault), self.assertRaises((worker.ScheduleError, tradier.TradierError)):
-                self.acquire(damaged, days, cutoff)
+            with self.subTest(fault=fault):
+                result, _ = self.acquire(damaged, days, cutoff)
+                self.assertEqual(result["summary"]["usable_latest_symbols"], 0)
+                self.assertTrue(all("latest" not in row for row in result["results"]))
 
     def test_calendar_holiday_and_missing_calendar_day(self):
         cutoff, days, rows = recent_fixture()
@@ -80,10 +83,11 @@ class RecentHistoryTests(unittest.TestCase):
         report, _ = self.acquire(rows, days, cutoff)
         self.assertEqual(report["results"][0]["valid_bars"], 19)
         del days[holiday]
-        with self.assertRaisesRegex(worker.ScheduleError, "Incomplete recent exchange calendar"):
-            self.acquire(rows, days, cutoff)
-        with self.assertRaises(worker.ScheduleError):
-            self.acquire(rows, {str(cutoff): days[str(cutoff)]}, cutoff)
+        result, _ = self.acquire(rows, days, cutoff)
+        self.assertEqual(result["summary"]["usable_latest_symbols"], 0)
+        self.assertIn("Incomplete recent exchange calendar", result["results"][0]["error"])
+        result, _ = self.acquire(rows, {str(cutoff): days[str(cutoff)]}, cutoff)
+        self.assertEqual(result["summary"]["usable_latest_symbols"], 0)
 
     def test_current_window_warnings_remain_visible_and_flat_windows_block(self):
         cutoff, days, rows = recent_fixture()
@@ -91,8 +95,9 @@ class RecentHistoryTests(unittest.TestCase):
         report, _ = self.acquire(rows, days, cutoff)
         self.assertEqual(report["results"][0]["warnings"][0]["code"], "open_outside_range")
         for row in rows: row.update(open=60, high=60, low=60, close=60)
-        with self.assertRaisesRegex(worker.ScheduleError, "Unavailable indicator/comparison"):
-            self.acquire(rows, days, cutoff)
+        result, _ = self.acquire(rows, days, cutoff)
+        self.assertEqual(result["summary"]["usable_latest_symbols"], 0)
+        self.assertIn("Unavailable indicator/comparison", result["results"][0]["error"])
 
     def test_fetch_requests_only_required_range_and_opts_into_old_exclusion(self):
         cutoff, _, rows = recent_fixture()
