@@ -15,7 +15,7 @@ Implemented: standalone Pushover test transport, TA-Lib Stochastic(14,3,3), pure
 crossing detection, and an explicitly invoked Tradier report for all 19 configured
 symbols. Range inconsistencies produce structured warnings without price repair.
 A pure full-universe formatter and explicitly authorized one-message Pushover
-report are also implemented. Local twice-daily launchd delivery is now commissioned
+report are also implemented. Local opening/closing launchd delivery and a bounded pre-close preview are commissioned
 and implemented, with a protected report-delivery ledger and wake/startup catch-up.
 An on-demand local browser now reads those retained reports and delivery state.
 RSI, SQLite monitoring/event persistence and automatic actionable alerts remain
@@ -620,7 +620,7 @@ the Mac is off is accepted; actionable alerts remain unimplemented.
 The Principal explicitly authorized activation on November 2, 2026. This is a
 local **LaunchAgent**, not cloud hosting. The operator must be logged into the
 Mac; sleep or power-off delays delivery until wake/login. No always-on promise
-is made. There are **two full-universe reports per regular trading day**:
+is made. There are **two completed-session reports per trading day**, plus the preview below:
 
 - **Opening, open +1 minute (normally 09:31 America/New_York):** uses the previous
   completed session, never the current intraday bar. It also recalculates that
@@ -817,6 +817,107 @@ new crossings and 13 sample warnings (zero on session), fit in 712 ASCII
 characters/UTF-8 bytes, and was accepted by Pushover. This verifies launchd-to-API
 operation; phone receipt for this newly automatic report still requires independent
 operator confirmation. Future closing-bar publication time remains unverified.
+
+## Pre-close preview — close minus 30 minutes
+
+Commissioned November 20, 2026. The existing minute LaunchAgent also checks one
+`YYYY-MM-DD:preclose` identity, due 30 minutes before the exchange calendar's
+regular-session close: normally **15:30 Eastern / 13:30 Mountain**; a 13:00 Eastern
+early close moves it to **12:30 Eastern / 10:30 Mountain**. Holidays/weekends have
+no slot. Opening and closing schedules and completed-session calculations are
+unchanged. No separate service, credentials, options-chain acquisition or trade
+capability is added. The push prompts the operator to review chains independently.
+
+The preview is **provisional**, not a completed daily signal. For each symbol,
+Tradier production `markets/history` supplies 18 verified contiguous completed
+exchange sessions; `markets/timesales` supplies today's regular-session `1min`
+OHLC with `session_filter=open`. The developing daily bar uses the first minute's
+open, maximum high, minimum low and latest returned close. The newest minute may
+still be forming. Its bucket-start timestamp is shown conservatively as the data
+time, **not** an independently verified last-trade timestamp. The data-time range
+across available symbols is in Eastern Time. A minute must be no more than 180
+seconds old when acquisition completes; timestamps, exact session-long minute
+continuity, daily-history calendar coverage and positive/finite OHLC are checked.
+Missing minutes are unavailable, never assumed to mean no trades or filled.
+Finite out-of-range prices retain structured warnings and are not clamped.
+
+TA-Lib STOCH(14,3,3), SMA/SMA, runs on the 18 completed bars plus exactly one
+provisional bar. The previous K is computed from the same sequence. The push lists
+all known oversold names (`K < 20`) by **full-precision K**, with symbol tie breaks;
+rounding is display only. It names unavailable symbols and reports coverage.
+Endpoint comparisons describe below-20 or back-at/above-20 changes **since the
+previous completed close**. They do not claim an observed crossing tick, the full
+intraday path, or that a provisional condition will persist to the close. Missing
+symbol evaluations do not imply no signal. Evidence retains per-symbol timestamps,
+completed inputs, the provisional candle, comparisons and warnings. Its
+`completed_session` remains the prior completed day; `provisional_session`
+identifies today explicitly, avoiding a false claim that today's candle is final.
+
+Preview work takes priority over old report-recovery work during its short window.
+Partial and even zero-coverage previews disclose unavailable evaluations using the
+existing symbol-isolation policy. There is **one push**, no recovery-update chain
+for an accepted preview. Pre-send failures can retry after the existing 15-minute
+backoff, obtaining fresh intraday inputs rather than reusing an old partial candle.
+Accepted and uncertain sends never automatically resend. Operational preview
+failures are retained in state/logs, without a redundant failure push.
+
+**Hard expiry:** no preview catch-up is created at/after the scheduled close.
+Waiting previews become `expired` with a reason. Expiry is checked before and after
+acquisition, after credential lookup, and by an optional transport callback after
+request preparation immediately before HTTP begins. That known no-send outcome is
+recorded as expired, while an actual transport exception remains unknown. Original
+opening/closing paths do not use the callback. An HTTP request started before the
+close may be accepted or reach a phone afterward; neither provider/device latency
+nor phone receipt is controlled or guaranteed. Sleep/login and retries can deliver
+only while the preview window is still open. Installation adds no LaunchAgent and
+preserves existing report JSON, logs and ledger entries. Version-1 ledger metadata
+adds `kind=preclose`, `expires`, and the terminal `expired` status for this slot.
+
+### Provider verification and precise coverage gap
+
+Official [Tradier market-data documentation](https://docs.tradier.com/brokerage-api/market-data)
+describes production real-time equities and 1-minute time-and-sales data (20 days
+with the open-session filter); sandbox data are delayed. Existing production market
+data credentials support the endpoint. A bounded **retrospective** November 20
+probe requested data through the 15:29 Eastern bucket, representing the moment just
+before the normal preview. Thirteen of 19 symbols supplied usable history and
+contiguous regular-session inputs. This verifies the acquisition/calculation path,
+not live pre-close publication latency or a complete-universe availability SLA.
+
+The six unavailable symbols had missing minute intervals. Follow-up reads over
+09:30–15:29 Eastern observed: CLX 358/360 intervals (missing 10:42, 14:10); ADM
+358/360 (10:42, 11:58); SWK 350/360; SHW 357/360; APD 345/360; TROW 355/360.
+For these follow-up responses there were no invalid OHLC, time/epoch disagreements
+or duplicates in the five fully classified diagnostics; ADM's successful second
+follow-up established its two missing intervals. Raw runtime evidence and complete
+missing-minute lists remain protected outside Git. Tradier has not supplied a
+verified empty-minute meaning, so absent intervals cannot prove the daily high/low.
+No quote fallback with unverified regular-session scope or historical daily-bar
+substitution masks this gap. Partial coverage remains explicit, as commissioned.
+
+### Synthetic sample — not sent
+
+```text
+Pre-close preview 2026-11-02
+PROVISIONAL | 18/19 available
+Data: 15:30:00–15:30:00 ET (minute buckets)
+Oversold (K<20): 3 known
+ADM K 3.00
+IBM K 3.00
+XOM K 3.01
+Below 20 vs prior close: ADM,IBM,XOM
+Back >=20 vs prior close: none known
+Unavailable: CLX
+Warnings: 0 | missing signals unknown
+Crossings provisional; intraday path unobserved.
+Informational. Review option chains independently.
+```
+
+This synthetic sample is 389 characters, within Pushover's 1,024-character limit.
+Offline tests cover normal/early-close/holiday/DST selection, missing/stale/sparse
+inputs, partial and zero coverage, quota stops, warnings, calculation and sorting,
+restart/uncertain-send deduplication, expiry during acquisition/credentials/request
+preparation, and the unchanged closing report running after an expired preview.
 
 ## Local report history — read-only browser
 

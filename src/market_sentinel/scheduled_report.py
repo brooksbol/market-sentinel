@@ -92,6 +92,35 @@ def due_reports(now, activated, sessions):
     return due
 
 
+def due_previews(now, activated, sessions):
+    """Only today's active close-minus-30m slot; no historical preview catch-up."""
+    local = now.astimezone(ET)
+    day = local.date()
+    hours = sessions.get(str(day))
+    if day < activated or not hours: return []
+    closing = datetime.combine(day,time.fromisoformat(hours['end']),ET)
+    due = closing-timedelta(minutes=30)
+    opening = datetime.combine(day,time.fromisoformat(hours['start']),ET)
+    if not max(due,opening) <= local < closing: return []
+    return [dict(id=f'{day}:preclose',observation=str(day),kind='preclose',session=str(day),
+                 due=due.isoformat(),expires=closing.isoformat())]
+
+
+class PreviewExpired(Exception):
+    """Known no-send outcome: preview deadline elapsed before HTTP began."""
+
+
+def guard_preview(slot, clock):
+    if clock() >= datetime.fromisoformat(slot['expires']): raise PreviewExpired()
+
+
+def expire_previews(state, now):
+    for item in state['deliveries'].values():
+        if (item.get('kind')=='preclose' and item.get('status')=='waiting' and
+                now >= datetime.fromisoformat(item['expires'])):
+            item.update(status='expired',expired=now.isoformat(),reason='Scheduled close reached; preview suppressed.')
+
+
 def screening_result(cutoff, results):
     valid = [row for row in results if row["status"] in ("calculated", "calculated_with_warnings")]
     warnings = sum(row["warning_count"] for row in valid)
@@ -166,6 +195,9 @@ def acquire_screening(token, cutoff, sessions, previous=None):
 
 def notification_body(screening, slot, *, recovery=False):
     """One all-symbol snapshot; unknown evaluations never count as no signal."""
+    if slot.get('kind') == 'preclose':
+        from market_sentinel.preclose import message
+        return message(screening,slot)
     if screening.get("summary", {}).get("completed_session") != slot["session"]:
         raise ScheduleError("Report session does not match the scheduled completed-session target.")
     prefix = "UPDATE " if recovery else ""
@@ -213,9 +245,11 @@ def read_state(root):
             str(date.fromisoformat(state["activated"])) != state["activated"]):
         raise ScheduleError("Invalid delivery ledger; operator inspection required.")
     for item in state["deliveries"].values():
-        if item.get("status") not in ("accepted", "attempting", "unknown", "waiting"):
+        if item.get("status") not in ("accepted", "attempting", "unknown", "waiting", "expired"):
             raise ScheduleError("Invalid delivery status; operator inspection required.")
     for identity, item in state["deliveries"].items():
+        if item.get('status')=='expired' and item.get('kind')!='preclose':
+            raise ScheduleError('Invalid expired completed-report status; operator inspection required.')
         if "recovery" in item:
             recovery = item["recovery"]
             if (not isinstance(recovery, dict) or recovery.get("id") != identity + ":recovery" or
@@ -293,9 +327,14 @@ def read_progress(root, slot):
     path = progress_path(root, slot)
     if not path.exists(): return None
     report = json.loads(path.read_text())
-    if report.get("slot_id") != slot["id"] or report.get("summary", {}).get("completed_session") != slot["session"]:
+    target = 'provisional_session' if slot.get('kind')=='preclose' else 'completed_session'
+    if report.get("slot_id") != slot["id"] or report.get("summary", {}).get(target) != slot["session"]:
         raise ScheduleError("Progress evidence does not match this slot/session; operator inspection required.")
-    format_daily_report(report, compact=True)  # Validate every retained row before reuse.
+    if slot.get('kind')=='preclose':
+        from market_sentinel.preclose import validate
+        validate(report,slot)
+    else:
+        format_daily_report(report, compact=True)  # Validate every retained row before reuse.
     return report
 
 
@@ -330,13 +369,14 @@ def current_failure(state):
     return max(failures, key=lambda item: datetime.fromisoformat(item["at"]).timestamp()) if failures else None
 
 
-def run_once(root, now=None):
+def run_once(root, now=None, *, clock=None):
     """One eligible acquisition per tick; failed slots have independent backoff.
 
     Never-attempted slots precede retries, then oldest last acquisition first.
     Accepted/unknown report and operational-alert sends never automatically resend.
     """
-    now = now or datetime.now(timezone.utc)
+    clock = clock or ((lambda: now) if now is not None else (lambda: datetime.now(timezone.utc)))
+    now = now or clock()
     with (root / "worker.lock").open("a") as lock:
         os.chmod(root / "worker.lock", 0o600)
         try:
@@ -357,7 +397,9 @@ def run_once(root, now=None):
         if interrupted:
             save_json(root / "state.json", state)
             log(root, now, "Previous notification intent interrupted; acceptance unknown. No automatic retry.")
+        expire_previews(state,clock())
         if state.get("retry_scope") == "calendar" and now.timestamp() < state.get("retry_after", 0):
+            save_json(root / "state.json",state)
             return 0
         try:
             today = now.astimezone(ET).date()
@@ -377,7 +419,7 @@ def run_once(root, now=None):
                     state["calendars"][key] = dict(checked=str(today), days=days)
                 month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
             sessions = {day: hours for entry in state["calendars"].values() for day, hours in entry["days"].items()}
-            due = due_reports(now, activated, sessions)
+            due = due_reports(now, activated, sessions) + due_previews(now,activated,sessions)
         except Exception as error:
             state.update(retry_after=now.timestamp() + RETRY_SECONDS, retry_scope="calendar")
             state["last_failure"] = dict(at=now.isoformat(), status=safe_failure(error) + " No report sent.")
@@ -407,7 +449,7 @@ def run_once(root, now=None):
             if delivered.get("status") == "accepted":
                 if recovery.get("status") == "waiting":
                     pending.append(dict(slot, recovery_update=True))
-            elif delivered.get("status") != "unknown":
+            elif delivered.get("status") not in ("unknown", "expired"):
                 pending.append(slot)
         # Preserve a legacy pre-send failure/backoff without replaying any send.
         if pending and state.get("retry_scope") != "calendar" and state.get("retry_after", 0):
@@ -425,15 +467,18 @@ def run_once(root, now=None):
             return 0
         def priority(item):
             attempted = task_entry(state, item).get("last_attempt")
-            return (datetime.fromisoformat(attempted).timestamp() if attempted else float("-inf"), item["due"])
+            return (0 if item.get('kind')=='preclose' else 1,
+                    datetime.fromisoformat(attempted).timestamp() if attempted else float("-inf"), item["due"])
         slot = min(eligible, key=priority)
         parent = state["deliveries"].setdefault(slot["id"], dict(slot, status="waiting"))
         recovering = bool(slot.get("recovery_update"))
         record = parent["recovery"] if recovering else parent
         record["last_attempt"] = now.isoformat()
         identity = record.get("id", slot["id"])
+        preview = slot['kind']=='preclose'
         try:
-            previous = read_progress(root, slot)
+            if preview: guard_preview(slot,clock)
+            previous = None if preview else read_progress(root, slot)
             if recovering and previous is None:
                 raise ScheduleError("Recovery progress evidence missing; retained results cannot be substituted.")
             if previous and not unresolved(previous):
@@ -443,10 +488,14 @@ def run_once(root, now=None):
                     token = token or load_token("production")
                 except Exception:
                     token = TradierError("Market-data credentials unavailable; no history requested.", stop_batch=True)
-                if previous is None:
+                if preview:
+                    from market_sentinel.preclose import acquire
+                    screening = acquire(token,slot,sessions,clock)
+                elif previous is None:
                     screening = acquire_screening(token, date.fromisoformat(slot["session"]), sessions)
                 else:
                     screening = acquire_screening(token, date.fromisoformat(slot["session"]), sessions, previous=previous)
+            if preview: guard_preview(slot,clock)
             screening["slot_id"] = slot["id"]
             body = notification_body(screening, slot, recovery=recovering)
             missing = unresolved(screening)
@@ -465,6 +514,12 @@ def run_once(root, now=None):
                 return 0  # Retained progress, not another partial push or failure alert.
             record["evidence_file"] = retain_snapshot(root, slot, screening, recovery=recovering)
             app_token, user_key = load_credentials()
+            if preview: guard_preview(slot,clock)
+        except PreviewExpired:
+            record.update(status='expired',expired=clock().isoformat(),reason='Scheduled close reached before HTTP; no preview sent.')
+            save_json(root / 'state.json',state)
+            log(root,clock(),record['reason'],identity)
+            return 0
         except Exception as error:
             record.update(retry_after=now.timestamp() + RETRY_SECONDS,
                           failure_count=record.get("failure_count", 0) + 1)
@@ -473,13 +528,23 @@ def run_once(root, now=None):
             save_json(root / "state.json", state)
             log(root, now, record["last_failure"]["status"], identity)
             # No redundant operational alert for symbol failures or accepted partials.
-            if not recovering: failure_alert(root, state, record, identity, now)
+            if not recovering and not preview: failure_alert(root, state, record, identity, now)
             return 1
         record.update(status="attempting", attempted=now.isoformat(), retry_after=0,
                       available_symbols=len(SYMBOLS)-len(missing))
         save_json(root / "state.json", state)
         try:
-            _send_message(app_token, user_key, TITLE, body, monospace=True)
+            if preview:
+                from market_sentinel.preclose import TITLE as preview_title
+                _send_message(app_token,user_key,preview_title,body,monospace=True,
+                              before_request=lambda:guard_preview(slot,clock))
+            else:
+                _send_message(app_token, user_key, TITLE, body, monospace=True)
+        except PreviewExpired:
+            record.update(status='expired',expired=clock().isoformat(),reason='Scheduled close reached before HTTP; no preview sent.')
+            save_json(root / 'state.json',state)
+            log(root,clock(),record['reason'],identity)
+            return 0
         except Exception:
             record["status"] = "unknown"
             save_json(root / "state.json", state)
@@ -487,7 +552,7 @@ def run_once(root, now=None):
             return 1
         record.update(status="accepted", accepted=datetime.now(timezone.utc).isoformat(),
                       characters=len(body), utf8_bytes=len(body.encode("utf-8")))
-        if not recovering and missing:
+        if not recovering and missing and not preview:
             record["recovery"] = dict(id=slot["id"] + ":recovery", status="waiting",
                                       retry_after=now.timestamp()+RETRY_SECONDS,
                                       last_attempt=now.isoformat(), unresolved_symbols=missing)

@@ -15,7 +15,7 @@ from test_daily_report import screening
 from test_tradier import fixture
 
 
-NOW = datetime(2026, 11, 2, 15, 0, tzinfo=worker.ET)
+NOW = datetime(2026, 11, 2, 14, 0, tzinfo=worker.ET)
 
 
 def month_payload(year=2026, month=11):
